@@ -7,7 +7,7 @@ One manual click per video (the render), everything either side automated.
 
 ## The desktop app
 
-Double-click **`Montage.cmd`**. Two tabs, matching the two halves of the job:
+Double-click **`Montage.cmd`** (or the desktop shortcut). Three tabs:
 
 1. **Prepare replay** — pick a `.mcpr`, set the shot, write the camera path.
    **Minecraft must be closed** for this: ReplayMod holds recordings open, and
@@ -20,7 +20,7 @@ Double-click **`Montage.cmd`**. Two tabs, matching the two halves of the job:
    lands private and stays private; a button then opens YouTube Studio if you
    want to publish it.
 
-The render itself sits between the two and happens inside Minecraft: Replay
+The render sits between tabs 1 and 2 and happens inside Minecraft: Replay
 Viewer → open the replay → Render Queue → Render.
 
 Use `Montage (debug).cmd` if it ever fails to start — same app, but with a
