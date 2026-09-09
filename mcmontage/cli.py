@@ -3,7 +3,7 @@
     python -m mcmontage status              what is set up and what is not
     python -m mcmontage inspect [REPLAY]    dump a .mcpr, validate the schema
     python -m mcmontage plan REPLAY ...     write a camera path into the replay
-    python -m mcmontage edit CLIP...        assemble the finished video
+    python -m mcmontage edit CLIP...        stitch clips, add music and titles
     python -m mcmontage upload VIDEO ...    upload (lands private)
 """
 
@@ -21,10 +21,6 @@ from . import music as music_mod
 from . import replay as replay_mod
 from . import pipeline as pipeline_mod
 from . import timeline as tl_mod
-
-# Target on-screen smoothing, in seconds of finished video. The replay-time
-# window is derived from this and the timelapse speed-up.
-SMOOTH_VIDEO_SECONDS = 1.5
 
 
 def _pick_replay(cfg, arg):
@@ -174,6 +170,7 @@ def cmd_edit(args):
             cfg, args.clips,
             output=args.out or (cfg.output / "montage.mp4"),
             title=args.title, subtitle=args.subtitle, music_id=args.music,
+            xfade=args.xfade,
         )
     except (pipeline_mod.PipelineError, music_mod.MusicError) as e:
         raise SystemExit(str(e))
@@ -235,8 +232,9 @@ def main(argv=None):
                    help="follow this entity id instead of auto-detecting")
     p.add_argument("--smooth", type=int, default=None,
                    help="ms window (replay time) for smoothing the followed "
-                        "path; default scales with the speed-up to hold about "
-                        "%.1fs of video-time smoothing" % SMOOTH_VIDEO_SECONDS)
+                        "path; by default the largest window whose drift stays "
+                        "within %d%% of the orbit radius is chosen by measurement"
+                        % int(pipeline_mod.SMOOTH_DEVIATION_FRACTION * 100))
     p.add_argument("--retrack", action="store_true",
                    help="re-extract entity tracks even if cached")
     p.add_argument("-x", type=float, help="static orbit centre X")
@@ -256,8 +254,12 @@ def main(argv=None):
     p.add_argument("--limit", type=int, default=12)
     p.set_defaults(func=cmd_tracks)
 
-    p = sub.add_parser("edit", help="assemble the finished video")
-    p.add_argument("clips", nargs="+")
+    p = sub.add_parser("edit",
+                       help="assemble the finished video (several clips are "
+                            "joined in order with a crossfade)")
+    p.add_argument("clips", nargs="+", help="clips in playback order")
+    p.add_argument("--xfade", type=float,
+                   help="crossfade seconds between clips (default from config)")
     p.add_argument("--out")
     p.add_argument("--title")
     p.add_argument("--subtitle")

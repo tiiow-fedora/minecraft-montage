@@ -257,9 +257,14 @@ def finish_video(
     title=None,
     subtitle=None,
     music_id=None,
+    xfade=None,
     log=print,
 ):
-    """Assemble rendered clips into the finished video. Returns (path, track)."""
+    """Assemble rendered clips into the finished video. Returns (path, track).
+
+    Multiple clips are joined in order with a crossfade, so each join costs
+    `xfade` seconds of total runtime.
+    """
     clips = [Path(c) for c in clips]
     if not clips:
         raise PipelineError("no clips selected")
@@ -281,7 +286,7 @@ def finish_video(
         music=track.file if track else None,
         title=title or None,
         subtitle=subtitle or None,
-        xfade=cfg.xfade,
+        xfade=cfg.xfade if xfade is None else xfade,
         music_gain_db=cfg.music_gain_db,
         music_fade_out=cfg.music_fade_out,
         crf=cfg.crf,

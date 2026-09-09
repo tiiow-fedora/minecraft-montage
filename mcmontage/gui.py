@@ -30,6 +30,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from . import config as config_mod
+from . import edit as edit_mod
 from . import music as music_mod
 from . import pipeline as pipeline_mod
 from . import replay as replay_mod
@@ -43,6 +44,8 @@ class App:
         self.cfg = config_mod.load("config.toml")
         self.messages = queue.Queue()
         self.busy = False
+        self._clips = []           # ordered Paths making up the tab-2 sequence
+        self._clip_durations = {}  # path -> seconds, probed once each
 
         root.title("Minecraft Montage")
         root.geometry("880x680")
@@ -145,45 +148,80 @@ class App:
         f = ttk.Frame(nb, padding=12)
         nb.add(f, text="2. Finish video")
 
-        ttk.Label(f, text="After rendering in Minecraft, pick the rendered file "
-                          "and add music and a title. Safe to run with "
-                          "Minecraft open or closed.",
-                  wraplength=800, foreground="#444").grid(
-            row=0, column=0, columnspan=4, sticky="w", pady=(0, 10))
+        ttk.Label(f, text="Add one or more rendered clips, put them in the order "
+                          "you want, then add music and a title. Clips are joined "
+                          "with a crossfade. Safe to run with Minecraft open.",
+                  wraplength=820, foreground="#444").grid(
+            row=0, column=0, columnspan=5, sticky="w", pady=(0, 10))
 
-        ttk.Label(f, text="Video:").grid(row=1, column=0, sticky="w")
+        ttk.Label(f, text="Renders:").grid(row=1, column=0, sticky="w")
         self.video_var = tk.StringVar()
         self.video_combo = ttk.Combobox(f, textvariable=self.video_var,
-                                        width=62, state="readonly")
+                                        width=52, state="readonly")
         self.video_combo.grid(row=1, column=1, sticky="we", padx=6)
-        ttk.Button(f, text="Refresh", command=self.refresh_videos).grid(row=1, column=2)
-        ttk.Button(f, text="Browse…", command=self.browse_video).grid(row=1, column=3)
+        ttk.Button(f, text="Add ↓", command=self.add_clip).grid(row=1, column=2)
+        ttk.Button(f, text="Refresh", command=self.refresh_videos).grid(row=1, column=3)
+        ttk.Button(f, text="Browse…", command=self.browse_video).grid(row=1, column=4)
 
-        ttk.Label(f, text="Title:").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        seq = ttk.LabelFrame(f, text="Sequence (top plays first)", padding=8)
+        seq.grid(row=2, column=0, columnspan=5, sticky="nsew", pady=10)
+
+        self.clip_list = tk.Listbox(seq, height=6, activestyle="dotbox",
+                                    font=("Consolas", 9), selectmode="browse")
+        clip_scroll = ttk.Scrollbar(seq, command=self.clip_list.yview)
+        self.clip_list.configure(yscrollcommand=clip_scroll.set)
+        self.clip_list.grid(row=0, column=0, rowspan=5, sticky="nsew")
+        clip_scroll.grid(row=0, column=1, rowspan=5, sticky="ns")
+
+        ttk.Button(seq, text="▲ Up", width=10,
+                   command=lambda: self.move_clip(-1)).grid(row=0, column=2, padx=6)
+        ttk.Button(seq, text="▼ Down", width=10,
+                   command=lambda: self.move_clip(1)).grid(row=1, column=2, padx=6)
+        ttk.Button(seq, text="✕ Remove", width=10,
+                   command=self.remove_clip).grid(row=2, column=2, padx=6, pady=(6, 0))
+        ttk.Button(seq, text="Clear", width=10,
+                   command=self.clear_clips).grid(row=3, column=2, padx=6)
+        ttk.Button(seq, text="▶ Preview", width=10,
+                   command=self.preview_clip).grid(row=4, column=2, padx=6, pady=(6, 0))
+
+        self.seq_summary = ttk.Label(seq, text="No clips yet.", foreground="#444")
+        self.seq_summary.grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        seq.columnconfigure(0, weight=1)
+        seq.rowconfigure(4, weight=1)
+
+        ttk.Label(f, text="Crossfade (s):").grid(row=3, column=0, sticky="w")
+        self.xfade_var = tk.StringVar(value=str(self.cfg.xfade))
+        xf = ttk.Entry(f, textvariable=self.xfade_var, width=8)
+        xf.grid(row=3, column=1, sticky="w", padx=6)
+        self.xfade_var.trace_add("write", lambda *_: self.update_seq_summary())
+
+        ttk.Label(f, text="Title:").grid(row=4, column=0, sticky="w", pady=(6, 0))
         self.title_var = tk.StringVar(value="Harrison's Long-Haul World")
         ttk.Entry(f, textvariable=self.title_var).grid(
-            row=2, column=1, columnspan=3, sticky="we", padx=6, pady=(10, 0))
+            row=4, column=1, columnspan=4, sticky="we", padx=6, pady=(6, 0))
 
-        ttk.Label(f, text="Subtitle:").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(f, text="Subtitle:").grid(row=5, column=0, sticky="w", pady=(6, 0))
         self.subtitle_var = tk.StringVar()
         ttk.Entry(f, textvariable=self.subtitle_var).grid(
-            row=3, column=1, columnspan=3, sticky="we", padx=6, pady=(6, 0))
+            row=5, column=1, columnspan=4, sticky="we", padx=6, pady=(6, 0))
 
-        ttk.Label(f, text="Music:").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(f, text="Music:").grid(row=6, column=0, sticky="w", pady=(6, 0))
         self.music_var = tk.StringVar()
         self.music_combo = ttk.Combobox(f, textvariable=self.music_var,
                                         width=40, state="readonly")
-        self.music_combo.grid(row=4, column=1, sticky="w", padx=6, pady=(6, 0))
+        self.music_combo.grid(row=6, column=1, sticky="w", padx=6, pady=(6, 0))
         ttk.Button(f, text="Refresh", command=self.refresh_music).grid(
-            row=4, column=2, pady=(6, 0))
+            row=6, column=2, pady=(6, 0))
 
         self.finish_btn = ttk.Button(f, text="Build finished video",
                                      command=self.do_finish)
-        self.finish_btn.grid(row=5, column=0, columnspan=2, sticky="w", pady=(16, 0))
+        self.finish_btn.grid(row=7, column=0, columnspan=2, sticky="w", pady=(14, 0))
         ttk.Button(f, text="Open output folder",
-                   command=self.open_output).grid(row=5, column=2, pady=(16, 0))
+                   command=self.open_output).grid(row=7, column=2, pady=(14, 0))
 
         f.columnconfigure(1, weight=1)
+        f.rowconfigure(2, weight=1)
 
     def _build_upload(self, nb):
         f = ttk.Frame(nb, padding=12)
@@ -386,12 +424,95 @@ class App:
             self._videos = [Path(p)] + list(self._videos)
             self.video_combo["values"] = [Path(p).name] + list(self.video_combo["values"])
             self.video_combo.current(0)
+            self.add_clip(Path(p))
 
     def open_output(self):
         out = Path(self.cfg.output).resolve()
         out.mkdir(parents=True, exist_ok=True)
         import os
         os.startfile(str(out))  # noqa: S606 - Windows shell open
+
+    # ------------------------------------------------------- clip sequence
+
+    def _duration(self, path):
+        """Probed length in seconds, cached. 0.0 if the file will not probe."""
+        key = str(path)
+        if key not in self._clip_durations:
+            try:
+                self._clip_durations[key] = edit_mod.probe(path).duration
+            except edit_mod.EditError:
+                self._clip_durations[key] = 0.0
+        return self._clip_durations[key]
+
+    def _xfade(self):
+        try:
+            return max(0.0, float(self.xfade_var.get()))
+        except (ValueError, AttributeError):
+            return 0.0
+
+    def redraw_clips(self):
+        self.clip_list.delete(0, "end")
+        for i, p in enumerate(self._clips, 1):
+            self.clip_list.insert(
+                "end", "%2d. %-42s %6.1fs" % (i, p.name[:42], self._duration(p)))
+        self.update_seq_summary()
+
+    def update_seq_summary(self):
+        if not self._clips:
+            self.seq_summary.configure(text="No clips yet.")
+            return
+        total = sum(self._duration(p) for p in self._clips)
+        joins = len(self._clips) - 1
+        final = max(0.0, total - joins * self._xfade())
+        self.seq_summary.configure(
+            text="%d clip%s, %.1fs of footage - %d crossfade%s = %.1fs final."
+                 % (len(self._clips), "" if len(self._clips) == 1 else "s",
+                    total, joins, "" if joins == 1 else "s", final))
+
+    def add_clip(self, path=None):
+        if path is None:
+            path = self._selected(self.video_combo, self._videos)
+        if path is None:
+            messagebox.showwarning("No render", "Pick a render to add.")
+            return
+        self._clips.append(Path(path))
+        self.redraw_clips()
+        self.clip_list.selection_clear(0, "end")
+        self.clip_list.selection_set("end")
+
+    def remove_clip(self):
+        sel = self.clip_list.curselection()
+        if not sel:
+            return
+        i = sel[0]
+        del self._clips[i]
+        self.redraw_clips()
+        if self._clips:
+            self.clip_list.selection_set(min(i, len(self._clips) - 1))
+
+    def clear_clips(self):
+        self._clips = []
+        self.redraw_clips()
+
+    def move_clip(self, delta):
+        sel = self.clip_list.curselection()
+        if not sel:
+            return
+        i = sel[0]
+        j = i + delta
+        if not (0 <= j < len(self._clips)):
+            return
+        self._clips[i], self._clips[j] = self._clips[j], self._clips[i]
+        self.redraw_clips()
+        self.clip_list.selection_set(j)
+
+    def preview_clip(self):
+        sel = self.clip_list.curselection()
+        if not sel:
+            messagebox.showinfo("Nothing selected", "Select a clip to preview.")
+            return
+        import os
+        os.startfile(str(self._clips[sel[0]]))  # noqa: S606 - Windows shell open
 
     def refresh_finished(self):
         folder = Path(self.cfg.output)
@@ -554,21 +675,39 @@ class App:
         self._run(job, "Uploading to YouTube…")
 
     def do_finish(self):
-        video = self._selected(self.video_combo, self._videos)
-        if video is None:
-            messagebox.showwarning("No video", "Pick a rendered video first.")
+        clips = list(self._clips)
+        if not clips:
+            messagebox.showwarning(
+                "No clips", "Add at least one render to the sequence.")
             return
+        missing = [c for c in clips if not c.is_file()]
+        if missing:
+            messagebox.showerror(
+                "Missing files",
+                "These are gone:\n" + "\n".join(m.name for m in missing))
+            return
+
         idx = self.music_combo.current()
         music_id = self._music[idx - 1].id if idx > 0 and self._music else None
         title = self.title_var.get().strip()
         subtitle = self.subtitle_var.get().strip()
+        xfade = self._xfade()
+
+        # Name the output after the first clip, but mark stitched sequences so
+        # a 4-clip montage does not overwrite the single-clip version.
+        stem = clips[0].stem + ("_final" if len(clips) == 1
+                                else "_montage_%dclips" % len(clips))
+        output = Path(self.cfg.output) / (stem + ".mp4")
 
         def job():
             self.log("")
-            self.log("=== Finishing %s ===" % video.name)
+            self.log("=== Finishing %d clip%s ==="
+                     % (len(clips), "" if len(clips) == 1 else "s"))
+            for i, c in enumerate(clips, 1):
+                self.log("  %d. %s (%.1fs)" % (i, c.name, self._duration(c)))
             out, _track = pipeline_mod.finish_video(
-                self.cfg, [video], title=title, subtitle=subtitle,
-                music_id=music_id, log=self.log,
+                self.cfg, clips, output=output, title=title, subtitle=subtitle,
+                music_id=music_id, xfade=xfade, log=self.log,
             )
             self.log("")
             self.log("Saved to %s" % out.resolve())

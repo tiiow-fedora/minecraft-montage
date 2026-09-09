@@ -14,8 +14,11 @@ Double-click **`Montage.cmd`** (or the desktop shortcut). Three tabs:
    the write fails with `WinError 5` otherwise. The app checks and tells you
    rather than failing obscurely. (The write is temp-file-then-rename, so a
    failure never damages the recording.)
-2. **Finish video** — pick the rendered `.mp4`, add music and a title, get the
-   finished file. Safe to run any time.
+2. **Finish video** — build a sequence from one or more rendered clips, then
+   add music and a title. Add clips with **Add ↓**, reorder with **▲/▼**, drop
+   one with **✕**, and check any of them with **▶ Preview**. The summary line
+   shows the finished length, crossfades already deducted. Safe to run any
+   time.
 3. **Upload (private)** — preview the video, check the description, upload. It
    lands private and stays private; a button then opens YouTube Studio if you
    want to publish it.
@@ -188,6 +191,14 @@ output — 25.00 s at 1920×1080 and 60 fps, matching the timeline duration and 
 `videoWidth` / `videoHeight` / `framesPerSecond` fields. A malformed envelope or
 wrong field names could not have produced a to-spec render.
 
+## Stitching clips
+
+Several clips are joined in order, each pair overlapping by a crossfade, so the
+finished runtime is `sum(durations) - (n-1) * xfade`. Clips are normalised to
+the first one's resolution and frame rate first, so renders made at different
+settings still join cleanly. One long build across several sessions therefore
+becomes one video: render each replay separately, then stack them in tab 2.
+
 ## Timelapse without dropping frames
 
 The TIME path maps video time onto replay time. Two keyframes spanning 30 min of
@@ -212,7 +223,7 @@ python -m mcmontage inspect                    # newest replay: entries + render
 python -m mcmontage tracks                     # list entities, spot the player
 python -m mcmontage plan --follow --radius 12 --height 6 --revolutions 0.5 --keyframes 60
 python -m mcmontage plan -x 100 -y 70 -z -40 --radius 28   # or a fixed centre
-python -m mcmontage edit out/render.mp4 --title "Base Build" --music atlantean_twilight
+python -m mcmontage edit clip1.mp4 clip2.mp4 clip3.mp4 --xfade 1.0 --title "Base Build" --music atlantean_twilight
 python -m mcmontage upload out/montage.mp4 --title "…" --music atlantean_twilight
 ```
 
