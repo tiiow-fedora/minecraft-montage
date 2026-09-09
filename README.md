@@ -16,6 +16,9 @@ Double-click **`Montage.cmd`**. Two tabs, matching the two halves of the job:
    failure never damages the recording.)
 2. **Finish video** — pick the rendered `.mp4`, add music and a title, get the
    finished file. Safe to run any time.
+3. **Upload (private)** — preview the video, check the description, upload. It
+   lands private and stays private; a button then opens YouTube Studio if you
+   want to publish it.
 
 The render itself sits between the two and happens inside Minecraft: Replay
 Viewer → open the replay → Render Queue → Render.
@@ -23,8 +26,9 @@ Viewer → open the replay → Render Queue → Render.
 Use `Montage (debug).cmd` if it ever fails to start — same app, but with a
 console so you can see why.
 
-Uploading is deliberately **not** in the app; it stays a conscious `mcmontage
-upload` from the terminal.
+Uploads are private-only and privacy is not a control on the form: an
+unverified API project cannot publish publicly anyway, so offering the choice
+would be a lie. Publishing stays a deliberate act in YouTube Studio.
 
 ## Why one click
 
@@ -139,11 +143,32 @@ applies a centred moving average, which also makes the camera trail slightly
 behind, reading as an operator following you rather than a rig welded to your
 back.
 
-The window is in **replay** time but what matters is how it looks in **video**
-time, so the default scales with the timelapse speed-up to hold ~1.5 s of
-on-screen smoothing. At ×4.9 that is ~7 s of replay; at ×17 it is ~25 s. A fixed
-window would look fine on a slow shot and judder badly on a fast one. Pass
-`--smooth` to override in replay milliseconds.
+**The window is chosen by measurement, not by a formula.** Smoothing also cuts
+corners: the smoothed point lags wherever you actually were, and how much lag a
+given window causes depends entirely on how fast you were moving. Measured on an
+11-minute session covering 5157 blocks:
+
+| window | worst drift from your real position |
+|--------|-------------------------------------|
+| 1000 ms | 1.8 blocks |
+| 2000 ms | 3.7 blocks |
+| 4000 ms | 35.2 blocks |
+| 8000 ms | 71.3 blocks |
+| 25000 ms | 97.8 blocks |
+
+With a 12-block orbit radius, anything past ~24 blocks means you are out of
+shot. So `choose_smoothing()` tries progressively smaller windows and takes the
+first whose worst-case drift fits a budget of 35% of the orbit radius.
+
+Two heuristics were tried and discarded: a **fixed** window (fine on a slow
+build, catastrophic on a fast one) and a window **scaled by the timelapse
+speed-up** (worse — it grows exactly when the subject is covering the most
+ground, which is precisely when lag hurts). Jitter is a sub-second physical
+thing; it does not scale with playback rate. The keyframe sampling itself
+already low-passes the path, so only a little extra smoothing is ever needed.
+
+`--smooth` overrides in replay milliseconds, and warns if the drift would push
+you out of frame.
 
 `--revolutions` defaults to 1.0 but is worth dropping to ~0.5 when following: a
 full spin on top of your own movement reads as restless.

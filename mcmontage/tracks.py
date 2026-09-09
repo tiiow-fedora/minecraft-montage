@@ -160,6 +160,49 @@ def identify_player(tracks, min_distance=20.0):
     return max(pool, key=lambda t: (len(t.points), t.end - t.start, -t.start))
 
 
+SMOOTH_CANDIDATES = (16000, 8000, 4000, 2000, 1000, 500)
+
+
+def max_deviation(track, smoothed, start_ms, end_ms, keyframes):
+    """Worst-case gap, in blocks, between a smoothed target and the real position.
+
+    Measured at the keyframe sample points, because those are the only places
+    the camera is actually pinned.
+    """
+    worst = 0.0
+    for i in range(keyframes):
+        f = i / max(1, keyframes - 1)
+        ts = start_ms + (end_ms - start_ms) * f
+        a = track.at(ts)
+        b = smoothed.at(ts)
+        d = math.dist(a, b)
+        worst = max(worst, d)
+    return worst
+
+
+def choose_smoothing(track, start_ms, end_ms, keyframes, max_deviation_blocks):
+    """Largest smoothing window that still keeps the subject in frame.
+
+    Smoothing removes jitter but also cuts corners: the smoothed point lags
+    behind wherever you actually were. How much lag a given window causes
+    depends entirely on how fast you were moving, so no fixed window -- and no
+    window scaled by the timelapse speed-up -- is right for every replay. On a
+    slow build 8s is fine; on an 11-minute session covering 5000 blocks the same
+    window puts the camera 70+ blocks off target and you leave the shot.
+
+    So rather than guess, measure: try progressively smaller windows and take
+    the first whose worst-case deviation stays inside the budget. Returns
+    (window_ms, deviation_blocks); window_ms of 0 means no smoothing, which is
+    already smooth because the keyframe sampling itself low-passes the path.
+    """
+    for window in SMOOTH_CANDIDATES:
+        smoothed = track.smoothed(window_ms=window)
+        dev = max_deviation(track, smoothed, start_ms, end_ms, keyframes)
+        if dev <= max_deviation_blocks:
+            return window, dev
+    return 0, 0.0
+
+
 def rank(tracks, limit=10):
     """Diagnostic ranking, most player-like first."""
     rows = [

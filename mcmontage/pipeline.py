@@ -20,9 +20,10 @@ from . import music as music_mod
 from . import replay as replay_mod
 from . import timeline as tl_mod
 
-# Target on-screen smoothing, in seconds of finished video. The replay-time
-# window is derived from this and the timelapse speed-up.
-SMOOTH_VIDEO_SECONDS = 1.5
+# How far the smoothed camera target may drift from where the player really
+# was, as a fraction of the orbit radius. Past this the subject starts
+# sliding out of frame.
+SMOOTH_DEVIATION_FRACTION = 0.35
 
 
 class PipelineError(RuntimeError):
@@ -111,16 +112,29 @@ def plan_replay(
             target = tracks_mod.identify_player(all_tracks)
             how = "auto-detected"
 
-        # Smoothing is applied in REPLAY time, but what matters is how it looks
-        # in VIDEO time: at x17 a 4s replay window is only ~0.2s of video and
-        # still judders. Scale it so on-screen smoothness stays constant.
+        # Pick the largest smoothing window that still keeps you in frame --
+        # see tracks.choose_smoothing for why no fixed or speed-up-scaled
+        # window works. The budget is a fraction of the orbit radius, since
+        # that is what decides whether the subject drifts out of shot.
+        budget = max(2.0, radius * SMOOTH_DEVIATION_FRACTION)
         if smooth is None:
-            smooth_ms = int(SMOOTH_VIDEO_SECONDS * speedup * 1000)
+            smooth_ms, dev = tracks_mod.choose_smoothing(
+                target, start, end, keyframes, budget)
+            log("Smoothing %d ms of replay time (worst drift %.1f blocks, "
+                "budget %.1f)." % (smooth_ms, dev, budget))
         else:
             smooth_ms = int(smooth)
+            sm = target.smoothed(window_ms=smooth_ms) if smooth_ms else target
+            dev = tracks_mod.max_deviation(target, sm, start, end, keyframes)
+            log("Smoothing %d ms of replay time (worst drift %.1f blocks)."
+                % (smooth_ms, dev))
+            if dev > radius * 2:
+                log("WARNING: that drift exceeds twice the orbit radius -- you "
+                    "will leave the shot. Try a smaller --smooth.")
 
+        aimed_at = target.smoothed(window_ms=smooth_ms) if smooth_ms else target
         pp = tl_mod.follow_orbit_path(
-            target.smoothed(window_ms=smooth_ms),
+            aimed_at,
             start, end, duration_ms,
             radius=radius, height=height,
             revolutions=revolutions, keyframes=keyframes,
@@ -133,8 +147,6 @@ def plan_replay(
         log("Following entity %d (%s): %d samples, %.0f blocks travelled."
             % (target.entity_id, how, len(target.points),
                target.distance_travelled()))
-        log("Smoothing %d ms of replay time (%.1fs of video at x%.1f)."
-            % (smooth_ms, smooth_ms / 1000.0 / speedup, speedup))
     else:
         if not centre or len(centre) != 3 or any(c is None for c in centre):
             raise PipelineError("a static orbit needs an X/Y/Z centre")
