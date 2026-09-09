@@ -1,0 +1,54 @@
+# Music library. Copy to tracks.toml and edit.
+#
+# Every track needs a licence record. The pipeline injects the credit into the
+# video description automatically -- see mcmontage/music.py.
+#
+# license values understood without extra ceremony:
+#   YOUTUBE_AUDIO_LIBRARY   no credit required by default (but check the track --
+#                           some YTAL entries do ask for one; set
+#                           attribution_required = true for those)
+#   CC0 / CC0-1.0           no credit required
+#   PIXABAY                 no credit required under the Pixabay Content Licence
+#   CC-BY-3.0 / CC-BY-4.0   CREDIT REQUIRED -- Kevin MacLeod / Incompetech is this
+#   CC-BY-SA-3.0 / -4.0     CREDIT REQUIRED
+#
+# Any other value is accepted but you must then set attribution_required
+# explicitly, so an unknown licence can never silently ship uncredited.
+
+# --- YouTube Audio Library: the safest default -------------------------------
+[[track]]
+id = "ytal_example"
+file = "music/your_ytal_track.mp3"
+title = "Track Title"
+artist = "Artist Name"
+source = "YouTube Audio Library"
+license = "YOUTUBE_AUDIO_LIBRARY"
+url = ""
+# attribution_required = true      # uncomment if this YTAL track asks for credit
+
+# --- Incompetech / Kevin MacLeod: CC-BY, credit is mandatory -----------------
+# The `attribution` field, when present, is used verbatim. Incompetech publishes
+# the exact wording it wants on each track's page -- paste it here rather than
+# letting the fallback build one.
+[[track]]
+id = "incompetech_example"
+file = "music/your_incompetech_track.mp3"
+title = "Track Title"
+artist = "Kevin MacLeod"
+source = "Incompetech"
+license = "CC-BY-4.0"
+url = "https://incompetech.com/music/royalty-free/"
+attribution = """\
+"Track Title" Kevin MacLeod (incompetech.com) \
+Licensed under Creative Commons: By Attribution 4.0 \
+http://creativecommons.org/licenses/by/4.0/"""
+
+# --- Pixabay ------------------------------------------------------------------
+[[track]]
+id = "pixabay_example"
+file = "music/your_pixabay_track.mp3"
+title = "Track Title"
+artist = "Artist Name"
+source = "Pixabay"
+license = "PIXABAY"
+url = "https://pixabay.com/music/"

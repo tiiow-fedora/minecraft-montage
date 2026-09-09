@@ -1,0 +1,284 @@
+"""The two pipeline stages either side of the manual render, as plain functions.
+
+The render itself happens inside Minecraft and cannot be automated (see README),
+so the work splits in two:
+
+    plan_replay()   before the render -- write a camera path into the .mcpr
+    finish_video()  after the render  -- music, title, fades
+
+Both the CLI and the GUI call these, so there is one implementation of each
+rather than two that drift apart.
+"""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+from . import edit as edit_mod
+from . import music as music_mod
+from . import replay as replay_mod
+from . import timeline as tl_mod
+
+# Target on-screen smoothing, in seconds of finished video. The replay-time
+# window is derived from this and the timelapse speed-up.
+SMOOTH_VIDEO_SECONDS = 1.5
+
+
+class PipelineError(RuntimeError):
+    pass
+
+
+def minecraft_running() -> bool:
+    """True if a Minecraft (javaw) process is up.
+
+    Matters because ReplayMod holds recordings open: writing a render queue into
+    a .mcpr while the game is running fails with WinError 5 on the final atomic
+    replace. The original survives -- the write is temp-file-then-replace -- but
+    the plan does not land.
+    """
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq javaw.exe", "/NH"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=15,
+        ).stdout or ""
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "javaw.exe" in out.lower()
+
+
+def plan_replay(
+    cfg,
+    replay_path,
+    seconds=30.0,
+    start=None,
+    end=None,
+    follow=True,
+    follow_entity=None,
+    smooth=None,
+    retrack=False,
+    centre=None,
+    radius=12.0,
+    height=6.0,
+    revolutions=0.5,
+    keyframes=90,
+    out_file=None,
+    append=False,
+    log=print,
+):
+    """Write a camera path into a replay's renderQueue.json. Returns a summary."""
+    replay_path = Path(replay_path)
+    info = replay_mod.inspect(replay_path)
+
+    replay_len = info.duration_ms or 0
+    start = 0 if start is None else int(start)
+    end = replay_len if end is None else int(end)
+    if end <= start:
+        raise PipelineError(
+            f"replay span is empty (start={start}, end={end}); the replay "
+            f"reports duration={replay_len}ms"
+        )
+
+    duration_ms = int(seconds * 1000)
+    speedup = tl_mod.speedup_factor(start, end, duration_ms)
+    tp = tl_mod.time_path(start, end, duration_ms)
+
+    summary = {
+        "replay": replay_path,
+        "start": start,
+        "end": end,
+        "seconds": seconds,
+        "speedup": speedup,
+    }
+
+    if follow or follow_entity is not None:
+        from . import tracks as tracks_mod
+
+        cache = Path(cfg.work) / (replay_path.stem + ".tracks.json")
+        if not cache.is_file() or retrack:
+            log("Extracting entity tracks (parsing the packet stream)...")
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            tracks_mod.dump(replay_path, cache)
+        all_tracks = tracks_mod.load(cache)
+
+        if follow_entity is not None:
+            if follow_entity not in all_tracks:
+                raise PipelineError(f"entity {follow_entity} has no track")
+            target = all_tracks[follow_entity]
+            how = "specified"
+        else:
+            target = tracks_mod.identify_player(all_tracks)
+            how = "auto-detected"
+
+        # Smoothing is applied in REPLAY time, but what matters is how it looks
+        # in VIDEO time: at x17 a 4s replay window is only ~0.2s of video and
+        # still judders. Scale it so on-screen smoothness stays constant.
+        if smooth is None:
+            smooth_ms = int(SMOOTH_VIDEO_SECONDS * speedup * 1000)
+        else:
+            smooth_ms = int(smooth)
+
+        pp = tl_mod.follow_orbit_path(
+            target.smoothed(window_ms=smooth_ms),
+            start, end, duration_ms,
+            radius=radius, height=height,
+            revolutions=revolutions, keyframes=keyframes,
+        )
+        summary.update(
+            mode="follow", entity=target.entity_id, entity_how=how,
+            samples=len(target.points),
+            travelled=target.distance_travelled(), smooth_ms=smooth_ms,
+        )
+        log("Following entity %d (%s): %d samples, %.0f blocks travelled."
+            % (target.entity_id, how, len(target.points),
+               target.distance_travelled()))
+        log("Smoothing %d ms of replay time (%.1fs of video at x%.1f)."
+            % (smooth_ms, smooth_ms / 1000.0 / speedup, speedup))
+    else:
+        if not centre or len(centre) != 3 or any(c is None for c in centre):
+            raise PipelineError("a static orbit needs an X/Y/Z centre")
+        pp = tl_mod.orbit_path(
+            tuple(float(c) for c in centre),
+            radius=radius, height=height, duration_ms=duration_ms,
+            revolutions=revolutions, keyframes=keyframes,
+        )
+        summary.update(mode="static", centre=tuple(centre))
+        log("Static orbit around (%.1f, %.1f, %.1f)." % tuple(centre))
+
+    out_file = out_file or str((Path(cfg.videos) / (replay_path.stem + ".mp4")).resolve())
+    settings = tl_mod.render_settings(
+        str(out_file), width=cfg.width, height=cfg.height, fps=cfg.fps,
+        bitrate=cfg.bitrate,
+    )
+    job = tl_mod.render_job(tl_mod.build_timeline(tp, pp), settings)
+
+    existing = (
+        replay_mod.read_render_queue(replay_path) if info.has_render_queue else []
+    )
+    jobs = (
+        [{"timeline": j["timeline"], "settings": j["settings"]} for j in existing]
+        if append else []
+    )
+    jobs.append(job)
+
+    if minecraft_running():
+        raise PipelineError(
+            "Minecraft is running, and it holds replay files open -- the write "
+            "would fail. Quit Minecraft to the desktop, then try again."
+        )
+
+    replay_mod.write_render_queue(replay_path, jobs)
+    summary["out_file"] = out_file
+    summary["jobs"] = len(jobs)
+    log("Wrote camera path into %s (%d job%s)."
+        % (replay_path.name, len(jobs), "" if len(jobs) == 1 else "s"))
+    return summary
+
+
+def build_upload_description(body, music_id=None):
+    """Final description text, with any required music credit appended."""
+    from . import youtube as yt_mod
+
+    track = music_mod.get(music_id) if music_id else None
+    if track:
+        track.validate()
+    return yt_mod.build_description(body or "", music_tracks=[track] if track else None)
+
+
+def upload_private(
+    cfg,
+    video,
+    title,
+    description="",
+    tags=None,
+    music_id=None,
+    progress=None,
+    log=print,
+):
+    """Upload to YouTube as PRIVATE. Returns the created video resource.
+
+    Privacy is hard-coded, not a parameter. An unverified API project has its
+    uploads permanently locked to private with no appeal, so offering a "public"
+    switch here would be a lie -- publishing happens in YouTube Studio.
+    """
+    from . import youtube as yt_mod
+
+    video = Path(video)
+    if not video.is_file():
+        raise PipelineError(f"no such video: {video}")
+
+    full_description = build_upload_description(description, music_id)
+    meta = yt_mod.VideoMeta(
+        title=(title or "").strip(),
+        description=full_description,
+        tags=[t.strip() for t in (tags or []) if t.strip()],
+        privacy="private",
+    )
+    try:
+        meta.validate()
+    except yt_mod.UploadError as e:
+        raise PipelineError(str(e)) from e
+
+    log("Uploading %s (%.1f MB) as PRIVATE..."
+        % (video.name, video.stat().st_size / 1e6))
+    log("If this is the first upload, a browser window will open for Google "
+        "sign-in -- approve it there and this will continue.")
+
+    try:
+        response = yt_mod.upload(video, meta, progress=progress)
+    except yt_mod.UploadError as e:
+        raise PipelineError(str(e)) from e
+
+    log("")
+    log("Uploaded, and it is PRIVATE.")
+    log("Watch : %s" % yt_mod.watch_url(response))
+    log("Studio: %s" % yt_mod.studio_url(response))
+    log("Nothing is public until you publish it yourself in Studio.")
+    return response
+
+
+def finish_video(
+    cfg,
+    clips,
+    output=None,
+    title=None,
+    subtitle=None,
+    music_id=None,
+    log=print,
+):
+    """Assemble rendered clips into the finished video. Returns (path, track)."""
+    clips = [Path(c) for c in clips]
+    if not clips:
+        raise PipelineError("no clips selected")
+
+    track = None
+    if music_id:
+        track = music_mod.get(music_id)
+        track.validate()
+        log("Music: %s (%s)" % (track.title, track.license))
+
+    if output is None:
+        output = Path(cfg.output) / (clips[0].stem + "_final.mp4")
+    output = Path(output)
+
+    log("Assembling %d clip%s with ffmpeg..."
+        % (len(clips), "" if len(clips) == 1 else "s"))
+    edit_mod.build(
+        clips, output,
+        music=track.file if track else None,
+        title=title or None,
+        subtitle=subtitle or None,
+        xfade=cfg.xfade,
+        music_gain_db=cfg.music_gain_db,
+        music_fade_out=cfg.music_fade_out,
+        crf=cfg.crf,
+    )
+    p = edit_mod.probe(output)
+    log("Done: %s -- %.1fs, %dx%d @ %.0f fps, audio=%s"
+        % (output, p.duration, p.width, p.height, p.fps, p.has_audio))
+    if track and track.needs_attribution:
+        log("")
+        log("Required credit (auto-added to any upload description):")
+        log("  " + track.credit())
+    return output, track

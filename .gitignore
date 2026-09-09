@@ -1,0 +1,18 @@
+.venv/
+work/
+out/
+secrets/
+music/tracks.toml
+music/*.mp3
+music/*.m4a
+music/*.wav
+__pycache__/
+*.pyc
+*.mcpr
+*.mcpr.bak
+
+# Build output: compiled classes, a machine-specific classpath, and jars
+# extracted out of the mod jar (not ours to redistribute).
+build/
+logs/
+icon.ico

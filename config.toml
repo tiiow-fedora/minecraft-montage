@@ -1,0 +1,20 @@
+# Defaults shown; delete a line to use the built-in default.
+
+[paths]
+# profile    = "C:/Users/user/AppData/Roaming/ModrinthApp/profiles/HarrisonsLongHaulWorld"
+# recordings = ""   # default: <profile>/replay_recordings
+# videos     = ""   # default: <profile>/replay_videos
+output = "out"
+work   = "work"
+
+[render]          # what ReplayMod renders (written into the replay's renderQueue.json)
+width   = 1920
+height  = 1080
+fps     = 60
+bitrate = 20000000
+
+[video]           # what the ffmpeg post-processing stage does
+xfade          = 1.0
+music_gain_db  = -16.0
+music_fade_out = 4.0
+crf            = 18
