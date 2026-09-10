@@ -10,7 +10,10 @@ One manual click per video (the render), everything either side automated.
 Double-click **`Montage.cmd`** (or the desktop shortcut). Three tabs:
 
 1. **Prepare replay** — pick a `.mcpr`, choose which part of it to use, set
-   the shot, write the camera path.
+   the shot, write the camera path. Or use **Or do a whole session at once**
+   at the bottom to prepare every clip from one play session in one go, using
+   the same camera settings — with a Preview button that shows exactly what it
+   would do before writing anything.
    **Minecraft must be closed** for this: ReplayMod holds recordings open, and
    the write fails with `WinError 5` otherwise. The app checks and tells you
    rather than failing obscurely. (The write is temp-file-then-rename, so a
@@ -224,7 +227,8 @@ the replay or ends before it starts.
 
 ## Batching a whole session
 
-`mcmontage sessions` groups recordings into play sessions, and `mcmontage batch`
+The batch panel at the bottom of tab 1 does this from the app. On the CLI,
+`mcmontage sessions` groups recordings into play sessions and `mcmontage batch`
 renames and prepares a whole session in one pass:
 
 ```bash

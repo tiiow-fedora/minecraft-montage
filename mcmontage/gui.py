@@ -1,6 +1,7 @@
 """Desktop app: prepare a replay, finish the render, upload it privately.
 
-    1. Prepare replay  -- pick a .mcpr, write a camera path into it.
+    1. Prepare replay  -- pick a .mcpr, choose a range, write a camera path
+                          into it; or prepare a whole play session at once.
                           Minecraft must be CLOSED: it holds replays open.
     2. Finish video    -- pick the rendered .mp4, add music and a title.
     3. Upload          -- private-only, behind a preview-and-confirm gate.
@@ -53,6 +54,7 @@ class App:
         self._finished = []
         self._music = []
         self._tracks = []   # chosen music, in play order
+        self._sessions = []
 
         root.title("Minecraft Montage")
         root.geometry("880x680")
@@ -77,6 +79,7 @@ class App:
         self.status.pack(fill="x", padx=12, pady=(0, 8))
 
         self.refresh_replays()
+        self.refresh_sessions()
         self.refresh_videos()
         self.refresh_music()
         self.refresh_finished()
@@ -173,6 +176,49 @@ class App:
         self.prepare_btn = ttk.Button(f, text="Write camera path into replay",
                                       command=self.do_prepare)
         self.prepare_btn.grid(row=4, column=0, columnspan=2, sticky="w")
+
+        batch = ttk.LabelFrame(
+            f, text="Or do a whole session at once", padding=10)
+        batch.grid(row=5, column=0, columnspan=4, sticky="we", pady=(14, 0))
+
+        ttk.Label(batch,
+                  text="Prepares every clip from one play session using the "
+                       "camera settings above. A play-day runs 04:00 to 04:00, "
+                       "so playing past midnight still counts as the same day.",
+                  wraplength=780, foreground="#444").grid(
+            row=0, column=0, columnspan=5, sticky="w", pady=(0, 8))
+
+        ttk.Label(batch, text="Session:").grid(row=1, column=0, sticky="w")
+        self.session_var = tk.StringVar()
+        self.session_combo = ttk.Combobox(batch, textvariable=self.session_var,
+                                          width=52, state="readonly")
+        self.session_combo.grid(row=1, column=1, sticky="we", padx=6)
+        ttk.Button(batch, text="Refresh",
+                   command=self.refresh_sessions).grid(row=1, column=2)
+
+        ttk.Label(batch, text="Max speed-up").grid(row=2, column=0, sticky="w",
+                                                   pady=(8, 0))
+        self.max_speedup_var = tk.StringVar(value="30")
+        ttk.Entry(batch, textvariable=self.max_speedup_var, width=8).grid(
+            row=2, column=1, sticky="w", padx=6, pady=(8, 0))
+        ttk.Label(batch, text="(0 = use whole replays; otherwise long ones are "
+                              "trimmed to a centred slice)",
+                  foreground="#666").grid(row=2, column=2, columnspan=3,
+                                          sticky="w", pady=(8, 0))
+
+        self.batch_rename_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(batch,
+                        text="Rename to dayN_M first (names are baked into the "
+                             "render queue, so this must happen before preparing)",
+                        variable=self.batch_rename_var).grid(
+            row=3, column=0, columnspan=5, sticky="w", pady=(8, 0))
+
+        ttk.Button(batch, text="Preview", command=self.preview_batch).grid(
+            row=4, column=0, sticky="w", pady=(10, 0))
+        self.batch_btn = ttk.Button(batch, text="Prepare whole session",
+                                    command=self.do_batch)
+        self.batch_btn.grid(row=4, column=1, sticky="w", padx=6, pady=(10, 0))
+        batch.columnconfigure(1, weight=1)
 
         f.columnconfigure(1, weight=1)
 
@@ -482,6 +528,10 @@ class App:
                     for i, t in enumerate(self._music):
                         if t.id in (music_ids or []):
                             self.up_music_list.selection_set(i)
+                elif kind == "batch_done":
+                    # a batch may have renamed files, so re-read both lists
+                    self.refresh_replays()
+                    self.refresh_sessions()
                 elif kind == "progress":
                     self.progress["value"] = payload
                 elif kind == "studio":
@@ -492,6 +542,7 @@ class App:
                     self.prepare_btn.configure(state="normal")
                     self.finish_btn.configure(state="normal")
                     self.upload_btn.configure(state="normal")
+                    self.batch_btn.configure(state="normal")
                 elif kind == "error":
                     messagebox.showerror("Something went wrong", payload)
         except queue.Empty:
@@ -506,6 +557,7 @@ class App:
         self.prepare_btn.configure(state="disabled")
         self.finish_btn.configure(state="disabled")
         self.upload_btn.configure(state="disabled")
+        self.batch_btn.configure(state="disabled")
         self.messages.put(("status", status))
 
         def worker():
@@ -590,6 +642,110 @@ class App:
         out.mkdir(parents=True, exist_ok=True)
         import os
         os.startfile(str(out))  # noqa: S606 - Windows shell open
+
+    # -------------------------------------------------------------- batch
+
+    def refresh_sessions(self):
+        from . import sessions as sessions_mod
+
+        try:
+            self._sessions = sessions_mod.group(
+                replay_mod.find_replays(self.cfg.recordings))
+        except sessions_mod.SessionError as exc:
+            self._sessions = []
+            self.log("Sessions: %s" % exc)
+        self.session_combo["values"] = [
+            "session %d  -  %s  -  %d clip%s, %.0f min"
+            % (s.index, s.day, len(s.clips), "" if len(s.clips) == 1 else "s",
+               s.total_minutes)
+            for s in self._sessions
+        ]
+        if self._sessions and not self.session_var.get():
+            self.session_combo.current(0)
+
+    def _batch_settings(self):
+        """(session, seconds, max_speedup, camera kwargs) or None if invalid."""
+        idx = self.session_combo.current()
+        if not (0 <= idx < len(self._sessions)):
+            messagebox.showwarning("No session", "Pick a session first.")
+            return None
+        try:
+            seconds = float(self.seconds_var.get())
+            max_speedup = float(self.max_speedup_var.get())
+            camera = dict(
+                radius=float(self.radius_var.get()),
+                height=float(self.height_var.get()),
+                revolutions=float(self.revs_var.get()),
+                keyframes=int(self.keyframes_var.get()),
+            )
+        except ValueError as exc:
+            messagebox.showerror("Check the numbers", str(exc))
+            return None
+        return self._sessions[idx], seconds, max_speedup, camera
+
+    def preview_batch(self):
+        from . import sessions as sessions_mod
+
+        got = self._batch_settings()
+        if not got:
+            return
+        session, seconds, max_speedup, _ = got
+        self.log("")
+        self.log("=== Preview: session %d, %d clip(s) ==="
+                 % (session.index, len(session.clips)))
+        if self.batch_rename_var.get():
+            plan = sessions_mod.rename_plan([session])
+            for src, dst in plan:
+                self.log("  rename %-18s -> %s" % (src.name, dst.name))
+            if not plan:
+                self.log("  names already correct, nothing to rename")
+        for c in session.clips:
+            start, end = pipeline_mod.centred_span(
+                c.duration_ms, seconds, max_speedup)
+            span = (c.duration_ms if start is None else end - start) / 60000.0
+            self.log("  %-18s %5.1f min -> %.0fs  (x%.0f)"
+                     % (c.path.name, span, seconds, span * 60 / seconds))
+        self.log("Nothing written — press \"Prepare whole session\" to do it.")
+
+    def do_batch(self):
+        got = self._batch_settings()
+        if not got:
+            return
+        session, seconds, max_speedup, camera = got
+
+        if pipeline_mod.minecraft_running():
+            messagebox.showwarning(
+                "Minecraft is running",
+                "Minecraft holds replay files open, so this would fail.\n\n"
+                "Quit Minecraft to the desktop, then try again.")
+            return
+        if not messagebox.askokcancel(
+            "Prepare whole session?",
+            "This will %sprepare %d clip(s) from session %d at %.0fs each.\n\n"
+            "Existing render queues in those replays are replaced."
+            % ("rename and " if self.batch_rename_var.get() else "",
+               len(session.clips), session.index, seconds),
+        ):
+            return
+
+        def job():
+            self.log("")
+            self.log("=== Batch preparing session %d ===" % session.index)
+            results, failures = pipeline_mod.batch_prepare(
+                self.cfg, [c.path for c in session.clips],
+                seconds=seconds,
+                max_speedup=max_speedup or None,
+                rename_scheme="day{session}_{n}" if self.batch_rename_var.get()
+                else None,
+                sessions_obj=[session],
+                follow=True, log=self.log, **camera
+            )
+            self.messages.put(("batch_done", None))
+            if not failures:
+                self.log("")
+                self.log("Now render each in game, then stitch them in tab 2.")
+
+        self._run(job, "Preparing session…")
 
     # ------------------------------------------------------ music sequence
 
