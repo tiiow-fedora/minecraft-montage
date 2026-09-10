@@ -237,8 +237,8 @@ def cmd_edit(args):
         pipeline_mod.finish_video(
             cfg, args.clips,
             output=args.out or (cfg.output / "montage.mp4"),
-            title=args.title, subtitle=args.subtitle, music_id=args.music,
-            xfade=args.xfade,
+            title=args.title, subtitle=args.subtitle,
+            music_ids=args.music, xfade=args.xfade,
         )
     except (pipeline_mod.PipelineError, music_mod.MusicError) as e:
         raise SystemExit(str(e))
@@ -247,10 +247,8 @@ def cmd_edit(args):
 def cmd_upload(args):
     from . import youtube as yt_mod
 
-    track = music_mod.get(args.music) if args.music else None
-    description = yt_mod.build_description(
-        args.description or "", music_tracks=[track] if track else None
-    )
+    description = pipeline_mod.build_upload_description(
+        args.description or "", args.music)
     meta = yt_mod.VideoMeta(
         title=args.title,
         description=description,
@@ -365,7 +363,9 @@ def main(argv=None):
     p.add_argument("--out")
     p.add_argument("--title")
     p.add_argument("--subtitle")
-    p.add_argument("--music", help="track id from music/tracks.toml")
+    p.add_argument("--music", action="append", default=None,
+                   help="track id from music/tracks.toml; repeat for several, "
+                        "which then share the runtime equally")
     p.set_defaults(func=cmd_edit)
 
     p = sub.add_parser("upload", help="upload to YouTube (lands private)")
@@ -373,7 +373,8 @@ def main(argv=None):
     p.add_argument("--title", required=True)
     p.add_argument("--description", default="")
     p.add_argument("--tags", default="")
-    p.add_argument("--music", help="track id, so its credit is appended")
+    p.add_argument("--music", action="append", default=None,
+                   help="track id whose credit to append; repeat for several")
     p.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     p.set_defaults(func=cmd_upload)
 

@@ -276,14 +276,27 @@ def batch_prepare(
     return results, failures
 
 
-def build_upload_description(body, music_id=None):
-    """Final description text, with any required music credit appended."""
+def resolve_tracks(music_ids):
+    """Track objects for one id, several ids, or None. Validates each."""
+    if not music_ids:
+        return []
+    if isinstance(music_ids, str):
+        music_ids = [music_ids]
+    library = music_mod.load_library()
+    tracks = []
+    for mid in music_ids:
+        t = music_mod.get(mid, library)
+        t.validate()
+        tracks.append(t)
+    return tracks
+
+
+def build_upload_description(body, music_ids=None):
+    """Final description text, with every required music credit appended."""
     from . import youtube as yt_mod
 
-    track = music_mod.get(music_id) if music_id else None
-    if track:
-        track.validate()
-    return yt_mod.build_description(body or "", music_tracks=[track] if track else None)
+    return yt_mod.build_description(body or "",
+                                    music_tracks=resolve_tracks(music_ids))
 
 
 def upload_private(
@@ -292,7 +305,7 @@ def upload_private(
     title,
     description="",
     tags=None,
-    music_id=None,
+    music_ids=None,
     progress=None,
     log=print,
 ):
@@ -308,7 +321,7 @@ def upload_private(
     if not video.is_file():
         raise PipelineError(f"no such video: {video}")
 
-    full_description = build_upload_description(description, music_id)
+    full_description = build_upload_description(description, music_ids)
     meta = yt_mod.VideoMeta(
         title=(title or "").strip(),
         description=full_description,
@@ -344,7 +357,7 @@ def finish_video(
     output=None,
     title=None,
     subtitle=None,
-    music_id=None,
+    music_ids=None,
     xfade=None,
     log=print,
 ):
@@ -357,11 +370,12 @@ def finish_video(
     if not clips:
         raise PipelineError("no clips selected")
 
-    track = None
-    if music_id:
-        track = music_mod.get(music_id)
-        track.validate()
-        log("Music: %s (%s)" % (track.title, track.license))
+    tracks = resolve_tracks(music_ids)
+    if tracks:
+        log("Music: %d track%s, sharing the runtime equally."
+            % (len(tracks), "" if len(tracks) == 1 else "s"))
+        for t in tracks:
+            log("  %s - %s (%s)" % (t.title, t.artist, t.license))
 
     if output is None:
         output = Path(cfg.output) / (clips[0].stem + "_final.mp4")
@@ -371,7 +385,7 @@ def finish_video(
         % (len(clips), "" if len(clips) == 1 else "s"))
     edit_mod.build(
         clips, output,
-        music=track.file if track else None,
+        music=[t.file for t in tracks] or None,
         title=title or None,
         subtitle=subtitle or None,
         xfade=cfg.xfade if xfade is None else xfade,
@@ -382,8 +396,11 @@ def finish_video(
     p = edit_mod.probe(output)
     log("Done: %s -- %.1fs, %dx%d @ %.0f fps, audio=%s"
         % (output, p.duration, p.width, p.height, p.fps, p.has_audio))
-    if track and track.needs_attribution:
+    needed = [t for t in tracks if t.needs_attribution]
+    if needed:
         log("")
-        log("Required credit (auto-added to any upload description):")
-        log("  " + track.credit())
-    return output, track
+        log("Required credit%s (auto-added to any upload description):"
+            % ("" if len(needed) == 1 else "s"))
+        for t in needed:
+            log("  " + t.credit())
+    return output, tracks

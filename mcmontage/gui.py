@@ -52,6 +52,7 @@ class App:
         self._videos = []
         self._finished = []
         self._music = []
+        self._tracks = []   # chosen music, in play order
 
         root.title("Minecraft Montage")
         root.geometry("880x680")
@@ -245,13 +246,37 @@ class App:
         ttk.Entry(f, textvariable=self.subtitle_var).grid(
             row=5, column=1, columnspan=4, sticky="we", padx=6, pady=(6, 0))
 
-        ttk.Label(f, text="Music:").grid(row=6, column=0, sticky="w", pady=(6, 0))
+        mus = ttk.LabelFrame(f, text="Music (several share the video equally)",
+                             padding=8)
+        mus.grid(row=6, column=0, columnspan=5, sticky="we", pady=(10, 0))
+
         self.music_var = tk.StringVar()
-        self.music_combo = ttk.Combobox(f, textvariable=self.music_var,
-                                        width=40, state="readonly")
-        self.music_combo.grid(row=6, column=1, sticky="w", padx=6, pady=(6, 0))
-        ttk.Button(f, text="Refresh", command=self.refresh_music).grid(
-            row=6, column=2, pady=(6, 0))
+        self.music_combo = ttk.Combobox(mus, textvariable=self.music_var,
+                                        width=44, state="readonly")
+        self.music_combo.grid(row=0, column=0, sticky="w")
+        ttk.Button(mus, text="Add ↓", command=self.add_track).grid(
+            row=0, column=1, padx=6)
+        ttk.Button(mus, text="Refresh", command=self.refresh_music).grid(
+            row=0, column=2)
+
+        self.track_list = tk.Listbox(mus, height=3, font=("Consolas", 9),
+                                     selectmode="browse")
+        self.track_list.grid(row=1, column=0, sticky="we", pady=(6, 0))
+        tbtn = ttk.Frame(mus)
+        tbtn.grid(row=1, column=1, columnspan=2, sticky="nw", pady=(6, 0))
+        ttk.Button(tbtn, text="▲", width=3,
+                   command=lambda: self.move_track(-1)).pack(side="left", padx=2)
+        ttk.Button(tbtn, text="▼", width=3,
+                   command=lambda: self.move_track(1)).pack(side="left", padx=2)
+        ttk.Button(tbtn, text="✕", width=3,
+                   command=self.remove_track).pack(side="left", padx=2)
+        ttk.Button(tbtn, text="Clear", width=6,
+                   command=self.clear_tracks).pack(side="left", padx=2)
+
+        self.music_summary = ttk.Label(mus, text="No music.", foreground="#444")
+        self.music_summary.grid(row=2, column=0, columnspan=3, sticky="w",
+                                pady=(6, 0))
+        mus.columnconfigure(0, weight=1)
 
         self.finish_btn = ttk.Button(f, text="Build finished video",
                                      command=self.do_finish)
@@ -297,14 +322,16 @@ class App:
         ttk.Entry(f, textvariable=self.up_tags_var).grid(
             row=4, column=1, columnspan=3, sticky="we", padx=6, pady=(6, 0))
 
-        ttk.Label(f, text="Music used:").grid(row=5, column=0, sticky="w", pady=(6, 0))
-        self.up_music_var = tk.StringVar()
-        self.up_music_combo = ttk.Combobox(f, textvariable=self.up_music_var,
-                                           width=40, state="readonly")
-        self.up_music_combo.grid(row=5, column=1, sticky="w", padx=6, pady=(6, 0))
-        ttk.Label(f, text="(its credit is added to the description "
-                          "automatically)", foreground="#666").grid(
-            row=5, column=2, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(f, text="Music used:").grid(row=5, column=0, sticky="nw", pady=(6, 0))
+        self.up_music_list = tk.Listbox(f, height=4, selectmode="extended",
+                                        exportselection=False,
+                                        font=("Consolas", 9))
+        self.up_music_list.grid(row=5, column=1, sticky="we", padx=6, pady=(6, 0))
+        ttk.Label(f, text="Ctrl-click for several. Every credit is added to\n"
+                          "the description automatically — filled in from\n"
+                          "tab 2 when you build a video.",
+                  foreground="#666", justify="left").grid(
+            row=5, column=2, columnspan=2, sticky="nw", pady=(6, 0))
 
         btns = ttk.Frame(f)
         btns.grid(row=6, column=0, columnspan=4, sticky="we", pady=(16, 0))
@@ -443,7 +470,7 @@ class App:
                     self.status.configure(text=payload)
                 elif kind == "finished":
                     # pre-fill the upload tab with what was just built
-                    path_str, title, music_id = payload
+                    path_str, title, music_ids = payload
                     self.refresh_finished()
                     for i, p in enumerate(self._finished):
                         if str(p.resolve()) == path_str:
@@ -451,11 +478,10 @@ class App:
                             break
                     if title and not self.up_title_var.get():
                         self.up_title_var.set(title)
-                    if music_id:
-                        for i, t in enumerate(self._music):
-                            if t.id == music_id:
-                                self.up_music_combo.current(i + 1)
-                                break
+                    self.up_music_list.selection_clear(0, "end")
+                    for i, t in enumerate(self._music):
+                        if t.id in (music_ids or []):
+                            self.up_music_list.selection_set(i)
                 elif kind == "progress":
                     self.progress["value"] = payload
                 elif kind == "studio":
@@ -527,10 +553,14 @@ class App:
         except music_mod.MusicError as exc:
             self._music = []
             self.log("Music library: %s" % exc)
-        labels = ["(no music)"] + ["%s — %s" % (t.id, t.title) for t in self._music]
-        self.music_combo["values"] = labels
-        if not self.music_var.get():
-            self.music_combo.current(1 if self._music else 0)
+        self.music_combo["values"] = [
+            "%s — %s" % (t.id, t.title) for t in self._music]
+        if self._music and not self.music_var.get():
+            self.music_combo.current(0)
+        # Drop anything no longer in the library from the chosen sequence.
+        known = {t.id for t in self._music}
+        self._tracks = [t for t in self._tracks if t.id in known]
+        self.redraw_tracks()
 
     def _selected(self, combo, items):
         idx = combo.current()
@@ -560,6 +590,62 @@ class App:
         out.mkdir(parents=True, exist_ok=True)
         import os
         os.startfile(str(out))  # noqa: S606 - Windows shell open
+
+    # ------------------------------------------------------ music sequence
+
+    def redraw_tracks(self):
+        self.track_list.delete(0, "end")
+        for i, t in enumerate(self._tracks, 1):
+            self.track_list.insert("end", "%d. %s - %s" % (i, t.title, t.artist))
+        self.update_music_summary()
+
+    def update_music_summary(self):
+        n = len(self._tracks)
+        if not n:
+            self.music_summary.configure(text="No music.")
+            return
+        total = sum(self._duration(p) for p in self._clips)
+        final = max(0.0, total - max(0, len(self._clips) - 1) * self._xfade())
+        share = final / n if n else 0
+        bits = ["%d track%s" % (n, "" if n == 1 else "s")]
+        if final:
+            bits.append("about %.0fs each" % share)
+        if n > 1:
+            bits.append("levels matched automatically")
+        credited = [t for t in self._tracks if t.needs_attribution]
+        if credited:
+            bits.append("%d need%s a credit (added for you)"
+                        % (len(credited), "" if len(credited) == 1 else ""))
+        self.music_summary.configure(text=", ".join(bits) + ".")
+
+    def add_track(self):
+        idx = self.music_combo.current()
+        if idx < 0 or not self._music:
+            messagebox.showwarning("No track", "Pick a track to add.")
+            return
+        self._tracks.append(self._music[idx])
+        self.redraw_tracks()
+
+    def remove_track(self):
+        sel = self.track_list.curselection()
+        if sel:
+            del self._tracks[sel[0]]
+            self.redraw_tracks()
+
+    def clear_tracks(self):
+        self._tracks = []
+        self.redraw_tracks()
+
+    def move_track(self, delta):
+        sel = self.track_list.curselection()
+        if not sel:
+            return
+        i, j = sel[0], sel[0] + delta
+        if not (0 <= j < len(self._tracks)):
+            return
+        self._tracks[i], self._tracks[j] = self._tracks[j], self._tracks[i]
+        self.redraw_tracks()
+        self.track_list.selection_set(j)
 
     # ------------------------------------------------------- clip sequence
 
@@ -654,11 +740,9 @@ class App:
         self.upload_combo["values"] = labels
         if labels and not self.upload_var.get():
             self.upload_combo.current(0)
-        self.up_music_combo["values"] = (
-            ["(none)"] + ["%s — %s" % (t.id, t.title) for t in self._music]
-        )
-        if not self.up_music_var.get():
-            self.up_music_combo.current(0)
+        self.up_music_list.delete(0, "end")
+        for t in self._music:
+            self.up_music_list.insert("end", "%s — %s" % (t.id, t.title))
 
     def browse_finished(self):
         p = filedialog.askopenfilename(
@@ -673,9 +757,9 @@ class App:
 
     def _upload_selection(self):
         video = self._selected(self.upload_combo, self._finished)
-        idx = self.up_music_combo.current()
-        music_id = self._music[idx - 1].id if idx > 0 and self._music else None
-        return video, music_id
+        ids = [self._music[i].id for i in self.up_music_list.curselection()
+               if 0 <= i < len(self._music)]
+        return video, ids
 
     def preview_upload(self):
         video, _ = self._upload_selection()
@@ -686,10 +770,10 @@ class App:
         os.startfile(str(video))  # noqa: S606 - Windows shell open
 
     def show_description(self):
-        _, music_id = self._upload_selection()
+        _, music_ids = self._upload_selection()
         body = self.up_desc.get("1.0", "end").strip()
         try:
-            text = pipeline_mod.build_upload_description(body, music_id)
+            text = pipeline_mod.build_upload_description(body, music_ids)
         except music_mod.MusicError as exc:
             messagebox.showerror("Music problem", str(exc))
             return
@@ -764,7 +848,7 @@ class App:
         self._run(job, "Preparing replay…")
 
     def do_upload(self):
-        video, music_id = self._upload_selection()
+        video, music_ids = self._upload_selection()
         if video is None:
             messagebox.showwarning("No video", "Pick a video first.")
             return
@@ -776,7 +860,7 @@ class App:
         tags = [t for t in self.up_tags_var.get().split(",")]
 
         try:
-            description = pipeline_mod.build_upload_description(body, music_id)
+            description = pipeline_mod.build_upload_description(body, music_ids)
         except music_mod.MusicError as exc:
             messagebox.showerror("Music problem", str(exc))
             return
@@ -808,7 +892,7 @@ class App:
 
             resp = pipeline_mod.upload_private(
                 self.cfg, video, title=title, description=body,
-                tags=tags, music_id=music_id,
+                tags=tags, music_ids=music_ids,
                 progress=on_progress, log=self.log,
             )
             from . import youtube as yt_mod
@@ -829,8 +913,7 @@ class App:
                 "These are gone:\n" + "\n".join(m.name for m in missing))
             return
 
-        idx = self.music_combo.current()
-        music_id = self._music[idx - 1].id if idx > 0 and self._music else None
+        music_ids = [t.id for t in self._tracks]
         title = self.title_var.get().strip()
         subtitle = self.subtitle_var.get().strip()
         xfade = self._xfade()
@@ -847,13 +930,13 @@ class App:
                      % (len(clips), "" if len(clips) == 1 else "s"))
             for i, c in enumerate(clips, 1):
                 self.log("  %d. %s (%.1fs)" % (i, c.name, self._duration(c)))
-            out, _track = pipeline_mod.finish_video(
+            out, _tracks = pipeline_mod.finish_video(
                 self.cfg, clips, output=output, title=title, subtitle=subtitle,
-                music_id=music_id, xfade=xfade, log=self.log,
+                music_ids=music_ids, xfade=xfade, log=self.log,
             )
             self.log("")
             self.log("Saved to %s" % out.resolve())
-            self.messages.put(("finished", (str(out.resolve()), title, music_id)))
+            self.messages.put(("finished", (str(out.resolve()), title, music_ids)))
 
         self._run(job, "Building video…")
 

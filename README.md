@@ -24,6 +24,10 @@ Double-click **`Montage.cmd`** (or the desktop shortcut). Three tabs:
    lands private and stays private; a button then opens YouTube Studio if you
    want to publish it.
 
+Music takes **several tracks**, not just one: add them in the Music box in tab 2
+and they share the video's runtime equally, crossfading into each other. Every
+track's credit is appended to the description automatically.
+
 The render sits between tabs 1 and 2 and happens inside Minecraft: Replay
 Viewer → open the replay → Render Queue → Render.
 
@@ -290,6 +294,16 @@ so nothing can silently ship uncredited.
 
 Safest first: **YouTube Audio Library** → Pixabay / CC0 → Incompetech (CC-BY,
 credit mandatory).
+
+### Several tracks per video
+
+Tracks share the runtime equally and crossfade into each other, and **each is
+loudness-normalised first**. That is not optional polish: of the four bundled
+tracks, Airship Serenity sits at −13.5 dB and Atlantean Twilight at −34 dB — a
+21 dB spread. Sequenced raw, the bed lurches from inaudible to blaring at every
+join. Normalising to a common target narrowed the measured spread across a
+three-track bed from 14.4 dB to 4.9 dB. A single track skips it, since its level
+is just the gain.
 
 Currently stocked: four Kevin MacLeod tracks (`atlantean_twilight`,
 `bathed_in_the_light`, `airship_serenity`, `arcadia`) from the Internet

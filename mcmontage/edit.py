@@ -190,6 +190,9 @@ def build(
     fade_out=2.5,
     music_gain_db=-16.0,
     music_fade_out=4.0,
+    music_xfade=3.0,
+    music_normalise=True,
+    music_lufs=-20.0,
     crf=18,
     preset="medium",
     fps=None,
@@ -198,7 +201,8 @@ def build(
     """Assemble `clips` into `output`, optionally with a title and music bed.
 
     clips  -- list of paths to rendered video files, joined in order
-    music  -- optional path to a music file; looped/trimmed to the video length
+    music  -- one path, or several; several share the runtime equally and are
+              crossfaded into each other by `music_xfade`
     xfade  -- crossfade duration in seconds between consecutive clips
 
     Returns the ffmpeg argument list actually used (handy for dry runs).
@@ -220,12 +224,18 @@ def build(
     args = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-stats"]
     for c in clips:
         args += ["-i", str(c)]
+    # music may be one path or several; several share the runtime equally
+    tracks = []
     if music:
-        music = Path(music)
-        if not music.is_file():
-            raise EditError(f"no such music file: {music}")
-        # loop the bed so short tracks still cover a long video
-        args += ["-stream_loop", "-1", "-i", str(music)]
+        tracks = [Path(music)] if isinstance(music, (str, Path)) else [
+            Path(m) for m in music]
+        for m in tracks:
+            if not m.is_file():
+                raise EditError(f"no such music file: {m}")
+            # Every track is looped, then trimmed to its share. Looping means a
+            # track shorter than its share still fills it instead of leaving
+            # silence, and the trim is what actually sets the length.
+            args += ["-stream_loop", "-1", "-i", str(m)]
 
     chains = []
 
@@ -272,11 +282,39 @@ def build(
         vmap = f"[{last}]"
 
     amap = None
-    if music:
-        mi = len(clips)
+    if tracks:
+        n = len(tracks)
+        # Each track gets an equal share. Crossfades overlap neighbours, so
+        # every share is padded by the overlap it gives away; without that the
+        # bed would finish (n-1)*music_xfade short of the video.
+        share = (total + (n - 1) * music_xfade) / n if n > 1 else total
+
+        # Normalise each track to a common loudness before sequencing them.
+        # Royalty-free tracks are mastered wildly differently -- of the four
+        # bundled here, one sits 21 dB below another -- so without this a
+        # multi-track bed lurches from inaudible to blaring at every join. One
+        # track alone does not need it, since its level is just the gain.
+        norm = (f",loudnorm=I={music_lufs}:TP=-2:LRA=11"
+                if (music_normalise and n > 1) else "")
+        for i in range(n):
+            chains.append(
+                f"[{len(clips) + i}:a]atrim=0:{share:.3f},asetpts=N/SR/TB"
+                f"{norm}"
+                f",aformat=sample_fmts=fltp:sample_rates=48000"
+                f":channel_layouts=stereo[m{i}]"
+            )
+
+        last_a = "m0"
+        for i in range(1, n):
+            nxt = f"ax{i}"
+            chains.append(
+                f"[{last_a}][m{i}]acrossfade=d={music_xfade}:c1=tri:c2=tri[{nxt}]"
+            )
+            last_a = nxt
+
         a_fade_out_start = max(0.0, total - music_fade_out)
         chains.append(
-            f"[{mi}:a]atrim=0:{total:.3f},asetpts=N/SR/TB,"
+            f"[{last_a}]atrim=0:{total:.3f},asetpts=N/SR/TB,"
             f"volume={music_gain_db}dB,"
             f"afade=t=in:st=0:d=1.5,"
             f"afade=t=out:st={a_fade_out_start:.3f}:d={music_fade_out},"
