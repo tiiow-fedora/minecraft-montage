@@ -9,7 +9,8 @@ One manual click per video (the render), everything either side automated.
 
 Double-click **`Montage.cmd`** (or the desktop shortcut). Three tabs:
 
-1. **Prepare replay** — pick a `.mcpr`, set the shot, write the camera path.
+1. **Prepare replay** — pick a `.mcpr`, choose which part of it to use, set
+   the shot, write the camera path.
    **Minecraft must be closed** for this: ReplayMod holds recordings open, and
    the write fails with `WinError 5` otherwise. The app checks and tells you
    rather than failing obscurely. (The write is temp-file-then-rename, so a
@@ -204,6 +205,25 @@ becomes one video: render each replay separately, then stack them in tab 2.
 The TIME path maps video time onto replay time. Two keyframes spanning 30 min of
 replay across 30 s of video give a ×60 speed-up — and it happens *in engine*, so
 every rendered frame is a real frame rather than a survivor of frame-dropping.
+
+### Picking a range
+
+Untick **Use the whole replay** to take a slice, in `m:ss` or `h:mm:ss`
+(`--start` / `--end` in milliseconds on the CLI). This matters more than it
+sounds on long sessions: a 73-minute recording squeezed into 20 s is a ×220
+timelapse that is too frantic to follow anyone through, whereas the five minutes
+where you actually built something is ×15 and watchable.
+
+The summary line under the fields shows the replay length, the slice, and the
+resulting speed-up as you type, and refuses a range that runs past the end of
+the replay or ends before it starts.
+
+## A trap: rename before you prepare, not after
+
+The output filename is baked into `renderQueue.json` when you prepare, derived
+from the replay's name at that moment. Rename the `.mcpr` afterwards and the
+render still writes the *old* name — so renders land under wrong names and can
+silently overwrite each other. Rename first, then prepare.
 
 ## Setup
 

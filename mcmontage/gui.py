@@ -46,6 +46,12 @@ class App:
         self.busy = False
         self._clips = []           # ordered Paths making up the tab-2 sequence
         self._clip_durations = {}  # path -> seconds, probed once each
+        # Populated by the refresh_* calls below, but the panel builders read
+        # them while laying out, so they must exist first.
+        self._replays = []
+        self._videos = []
+        self._finished = []
+        self._music = []
 
         root.title("Minecraft Montage")
         root.geometry("880x680")
@@ -92,11 +98,37 @@ class App:
         self.replay_combo = ttk.Combobox(f, textvariable=self.replay_var,
                                          width=62, state="readonly")
         self.replay_combo.grid(row=1, column=1, sticky="we", padx=6)
+        self.replay_combo.bind("<<ComboboxSelected>>", self._on_replay_selected)
         ttk.Button(f, text="Refresh", command=self.refresh_replays).grid(row=1, column=2)
         ttk.Button(f, text="Browse…", command=self.browse_replay).grid(row=1, column=3)
 
+        rng = ttk.LabelFrame(f, text="Which part of the replay", padding=10)
+        rng.grid(row=2, column=0, columnspan=4, sticky="we", pady=(10, 0))
+
+        self.range_all_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(rng, text="Use the whole replay",
+                        variable=self.range_all_var,
+                        command=self._toggle_range).grid(
+            row=0, column=0, columnspan=6, sticky="w")
+
+        ttk.Label(rng, text="From").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.start_var = tk.StringVar(value="0:00")
+        self.start_entry = ttk.Entry(rng, textvariable=self.start_var, width=10)
+        self.start_entry.grid(row=1, column=1, sticky="w", padx=(4, 12), pady=(6, 0))
+
+        ttk.Label(rng, text="to").grid(row=1, column=2, sticky="w", pady=(6, 0))
+        self.end_var = tk.StringVar()
+        self.end_entry = ttk.Entry(rng, textvariable=self.end_var, width=10)
+        self.end_entry.grid(row=1, column=3, sticky="w", padx=(4, 12), pady=(6, 0))
+
+        ttk.Label(rng, text="(m:ss or h:mm:ss)", foreground="#666").grid(
+            row=1, column=4, sticky="w", pady=(6, 0))
+
+        self.range_summary = ttk.Label(rng, text="", foreground="#444")
+        self.range_summary.grid(row=2, column=0, columnspan=6, sticky="w", pady=(8, 0))
+
         opts = ttk.LabelFrame(f, text="Camera", padding=10)
-        opts.grid(row=2, column=0, columnspan=4, sticky="we", pady=12)
+        opts.grid(row=3, column=0, columnspan=4, sticky="we", pady=12)
 
         self.seconds_var = tk.StringVar(value="40")
         self.follow_var = tk.BooleanVar(value=True)
@@ -139,10 +171,17 @@ class App:
 
         self.prepare_btn = ttk.Button(f, text="Write camera path into replay",
                                       command=self.do_prepare)
-        self.prepare_btn.grid(row=3, column=0, columnspan=2, sticky="w")
+        self.prepare_btn.grid(row=4, column=0, columnspan=2, sticky="w")
 
         f.columnconfigure(1, weight=1)
+
+        # Traces go on last: seconds_var only exists once the Camera box above
+        # has been built, and the summary reads all three.
+        for var in (self.start_var, self.end_var, self.seconds_var):
+            var.trace_add("write", lambda *_: self.update_range_summary())
+
         self._toggle_follow()
+        self._toggle_range()
 
     def _build_finish(self, nb):
         f = ttk.Frame(nb, padding=12)
@@ -288,6 +327,96 @@ class App:
         f.columnconfigure(1, weight=1)
 
     # -------------------------------------------------------------- helpers
+
+    @staticmethod
+    def parse_time(text):
+        """'90' | '1:30' | '1:02:03' | '1:30.5' -> milliseconds. '' -> None.
+
+        Raises ValueError on anything else, so a typo is reported rather than
+        silently becoming 0 and rendering the wrong part of the replay.
+        """
+        text = (text or "").strip()
+        if not text:
+            return None
+        parts = text.split(":")
+        if len(parts) > 3:
+            raise ValueError("too many ':' in %r" % text)
+        try:
+            nums = [float(p) for p in parts]
+        except ValueError:
+            raise ValueError("not a time: %r" % text) from None
+        if any(n < 0 for n in nums):
+            raise ValueError("negative time: %r" % text)
+        seconds = 0.0
+        for n in nums:                    # h:m:s, m:s, or s
+            seconds = seconds * 60 + n
+        return int(round(seconds * 1000))
+
+    @staticmethod
+    def format_time(ms):
+        total = int(round((ms or 0) / 1000))
+        h, rem = divmod(total, 3600)
+        m, s = divmod(rem, 60)
+        return "%d:%02d:%02d" % (h, m, s) if h else "%d:%02d" % (m, s)
+
+    def _selected_replay_duration(self):
+        p = self._selected(self.replay_combo, self._replays)
+        if p is None:
+            return None
+        try:
+            return replay_mod.inspect(p).duration_ms or None
+        except replay_mod.ReplayError:
+            return None
+
+    def _on_replay_selected(self, _event=None):
+        dur = self._selected_replay_duration()
+        if dur and not self.end_var.get().strip():
+            self.end_var.set(self.format_time(dur))
+        self.update_range_summary()
+
+    def _toggle_range(self):
+        state = "disabled" if self.range_all_var.get() else "normal"
+        self.start_entry.configure(state=state)
+        self.end_entry.configure(state=state)
+        self.update_range_summary()
+
+    def range_ms(self):
+        """(start_ms, end_ms) for the plan, or (None, None) for the whole replay."""
+        if self.range_all_var.get():
+            return None, None
+        return self.parse_time(self.start_var.get()), self.parse_time(self.end_var.get())
+
+    def update_range_summary(self):
+        dur = self._selected_replay_duration()
+        if dur is None:
+            self.range_summary.configure(text="Pick a replay to see its length.")
+            return
+        try:
+            start, end = self.range_ms()
+        except ValueError as exc:
+            self.range_summary.configure(text="Bad time: %s" % exc)
+            return
+        start = 0 if start is None else start
+        end = dur if end is None else end
+
+        bits = ["Replay is %s long." % self.format_time(dur)]
+        if end > dur:
+            bits.append("END IS PAST THE END of the replay.")
+        elif end <= start:
+            bits.append("End must be after start.")
+        else:
+            span = end - start
+            bits.append("Using %s (%s to %s)."
+                        % (self.format_time(span), self.format_time(start),
+                           self.format_time(end)))
+            try:
+                secs = float(self.seconds_var.get())
+                if secs > 0:
+                    bits.append("-> %.0fs video, x%.0f speed-up."
+                                % (secs, (span / 1000.0) / secs))
+            except ValueError:
+                pass
+        self.range_summary.configure(text="  ".join(bits))
 
     def _toggle_follow(self):
         state = "disabled" if self.follow_var.get() else "normal"
@@ -600,15 +729,28 @@ class App:
             if not follow:
                 centre = (float(self.cx_var.get()), float(self.cy_var.get()),
                           float(self.cz_var.get()))
+            start_ms, end_ms = self.range_ms()
         except ValueError as exc:
             messagebox.showerror("Check the numbers", str(exc))
+            return
+
+        dur = self._selected_replay_duration()
+        if dur and end_ms and end_ms > dur:
+            messagebox.showerror(
+                "Range past the end",
+                "The replay is only %s long, but the range ends at %s."
+                % (self.format_time(dur), self.format_time(end_ms)))
+            return
+        if end_ms is not None and start_ms is not None and end_ms <= start_ms:
+            messagebox.showerror("Bad range", "End must be after start.")
             return
 
         def job():
             self.log("")
             self.log("=== Preparing %s ===" % replay.name)
             summary = pipeline_mod.plan_replay(
-                self.cfg, replay, seconds=seconds, follow=follow, centre=centre,
+                self.cfg, replay, seconds=seconds, start=start_ms, end=end_ms,
+                follow=follow, centre=centre,
                 radius=radius, height=height, revolutions=revs,
                 keyframes=keyframes, log=self.log,
             )
