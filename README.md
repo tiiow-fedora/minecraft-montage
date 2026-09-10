@@ -218,6 +218,37 @@ The summary line under the fields shows the replay length, the slice, and the
 resulting speed-up as you type, and refuses a range that runs past the end of
 the replay or ends before it starts.
 
+## Batching a whole session
+
+`mcmontage sessions` groups recordings into play sessions, and `mcmontage batch`
+renames and prepares a whole session in one pass:
+
+```bash
+python -m mcmontage sessions
+python -m mcmontage batch --seconds 18 --max-speedup 30 --rename --dry-run
+python -m mcmontage batch --seconds 18 --max-speedup 30 --rename
+```
+
+Then render each replay in game and stitch them in tab 2.
+
+**The day boundary is not midnight.** A play-day runs 04:00 to 04:00
+(`--cutoff`), so a session running 22:00 → 01:30 stays one sitting instead of
+being split in two and numbered wrongly. `--max-gap` splits a day further when
+there is a long quiet stretch, for days you play twice.
+
+Grouping uses the recording time from each replay's own `metaData.json`, never
+file mtime — writing a render queue rewrites the archive and bumps mtime, so
+mtime stops reflecting when you actually played.
+
+**`--max-speedup` is what makes batching usable on long sessions.** Whole
+replays at a fixed clip length give wildly different rates — 21, 33, 38 and 73
+minutes at 18 s each is ×71, ×109, ×126 and ×244. Capping at ×30 takes a centred
+slice of each instead, so every clip runs at the same watchable rate. Centred,
+because the start of a recording is usually spawning in and the end is usually
+logging out.
+
+Renaming happens **before** preparing, never after — see the trap below.
+
 ## A trap: rename before you prepare, not after
 
 The output filename is baked into `renderQueue.json` when you prepare, derived

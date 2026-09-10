@@ -188,6 +188,94 @@ def plan_replay(
     return summary
 
 
+def centred_span(duration_ms, seconds, max_speedup):
+    """Pick a source span so the timelapse never exceeds `max_speedup`.
+
+    A whole 73-minute replay squeezed into 18s is x244, far too frantic to
+    follow anyone through. Capping the speed-up takes a centred slice instead --
+    centred because the start of a recording is usually spawning in and the end
+    is usually logging out, so the middle is the part worth watching.
+
+    Returns (start_ms, end_ms), or (None, None) to mean the whole replay.
+    """
+    if not max_speedup or not duration_ms:
+        return None, None
+    wanted = int(seconds * max_speedup * 1000)
+    if wanted >= duration_ms:
+        return None, None
+    middle = duration_ms // 2
+    half = wanted // 2
+    return max(0, middle - half), min(duration_ms, middle + half)
+
+
+def batch_prepare(
+    cfg,
+    clips,
+    seconds=20.0,
+    max_speedup=None,
+    rename_scheme=None,
+    sessions_obj=None,
+    log=print,
+    **camera
+):
+    """Prepare a whole session's worth of replays in one pass.
+
+    Renaming happens FIRST when asked for, never after: the output filename is
+    baked into renderQueue.json at prepare time, so renaming afterwards leaves
+    every replay pointing at its old name.
+
+    Failures are collected rather than aborting the batch -- one unreadable
+    replay should not cost you the other five. Returns (results, failures).
+    """
+    from . import sessions as sessions_mod
+
+    if minecraft_running():
+        raise PipelineError(
+            "Minecraft is running, and it holds replay files open. Quit it to "
+            "the desktop, then run this again."
+        )
+
+    paths = [Path(c) for c in clips]
+
+    if rename_scheme:
+        groups = sessions_obj or sessions_mod.group(paths)
+        plan = sessions_mod.rename_plan(groups, rename_scheme)
+        if plan:
+            log("Renaming %d file%s:" % (len(plan), "" if len(plan) == 1 else "s"))
+            for src, dst in sessions_mod.apply_renames(plan):
+                log("  %-16s -> %s" % (src.name, dst.name))
+            moved = {src: dst for src, dst in plan}
+            paths = [moved.get(p, p) for p in paths]
+        else:
+            log("Names are already correct, nothing to rename.")
+
+    results, failures = [], []
+    for i, path in enumerate(paths, 1):
+        log("")
+        log("[%d/%d] %s" % (i, len(paths), path.name))
+        try:
+            info = replay_mod.inspect(path)
+            start, end = centred_span(info.duration_ms or 0, seconds, max_speedup)
+            if start is not None:
+                log("  Capping at x%g: using %.1f min from the middle of %.1f."
+                    % (max_speedup, (end - start) / 60000.0,
+                       (info.duration_ms or 0) / 60000.0))
+            summary = plan_replay(
+                cfg, path, seconds=seconds, start=start, end=end,
+                log=lambda m: log("  " + m), **camera
+            )
+            results.append(summary)
+        except (PipelineError, replay_mod.ReplayError, OSError) as exc:
+            log("  FAILED: %s" % exc)
+            failures.append((path, str(exc)))
+
+    log("")
+    log("Prepared %d of %d." % (len(results), len(paths)))
+    if failures:
+        log("Failed: " + ", ".join(p.name for p, _ in failures))
+    return results, failures
+
+
 def build_upload_description(body, music_id=None):
     """Final description text, with any required music credit appended."""
     from . import youtube as yt_mod

@@ -163,6 +163,74 @@ def cmd_tracks(args):
     print("Pass --follow to orbit the marked entity, or --follow-entity ID to override.")
 
 
+def _sessions(cfg, args):
+    from . import sessions as sessions_mod
+
+    paths = replay_mod.find_replays(cfg.recordings)
+    if not paths:
+        raise SystemExit(f"no .mcpr files in {cfg.recordings}")
+    return sessions_mod.group(
+        paths, cutoff_hour=args.cutoff, max_gap_minutes=args.max_gap)
+
+
+def cmd_sessions(args):
+    cfg = config_mod.load(args.config)
+    groups = _sessions(cfg, args)
+    print("A play-day runs %02d:00 to %02d:00, so playing past midnight still "
+          "counts as the day you started.\n" % (args.cutoff, args.cutoff))
+    for s in groups:
+        print("session %d  -  play-day %s  -  %d clip(s), %.0f min of footage"
+              % (s.index, s.day, len(s.clips), s.total_minutes))
+        for c in s.clips:
+            print("    %-18s %s  %5.1f min  -> %s"
+                  % (c.path.name, c.recorded.strftime("%H:%M"), c.minutes,
+                     s.name_for(c, args.scheme) + c.path.suffix))
+        print()
+
+
+def cmd_batch(args):
+    cfg = config_mod.load(args.config)
+    groups = _sessions(cfg, args)
+    chosen = [s for s in groups if args.session in (None, s.index)]
+    if not chosen:
+        raise SystemExit("no session %s; run `mcmontage sessions` to list them"
+                         % args.session)
+
+    clips = [c.path for s in chosen for c in s.clips]
+    print("Preparing %d clip(s) from session(s) %s at %.0fs each."
+          % (len(clips), ", ".join(str(s.index) for s in chosen), args.seconds))
+    if args.dry_run:
+        from . import sessions as sessions_mod
+        print("\n--- dry run, nothing written ---")
+        if args.rename:
+            for src, dst in sessions_mod.rename_plan(chosen, args.scheme):
+                print("  rename %-18s -> %s" % (src.name, dst.name))
+        for s in chosen:
+            for c in s.clips:
+                start, end = pipeline_mod.centred_span(
+                    c.duration_ms, args.seconds, args.max_speedup)
+                span = (c.duration_ms if start is None else end - start) / 60000.0
+                print("  prepare %-18s %.1f min -> %.0fs  (x%.0f)"
+                      % (c.path.name, span, args.seconds,
+                         span * 60 / args.seconds))
+        return
+
+    try:
+        pipeline_mod.batch_prepare(
+            cfg, clips,
+            seconds=args.seconds,
+            max_speedup=args.max_speedup,
+            rename_scheme=args.scheme if args.rename else None,
+            sessions_obj=chosen,
+            follow=True,
+            radius=args.radius, height=args.height,
+            revolutions=args.revolutions, keyframes=args.keyframes,
+        )
+    except pipeline_mod.PipelineError as e:
+        raise SystemExit(str(e))
+    print("\nNow render each one in game, then stitch them in tab 2.")
+
+
 def cmd_edit(args):
     cfg = config_mod.load(args.config)
     try:
@@ -247,6 +315,40 @@ def main(argv=None):
     p.add_argument("--out", help="rendered video path the mod should write")
     p.add_argument("--append", action="store_true", help="keep existing queue jobs")
     p.set_defaults(func=cmd_plan)
+
+    def _session_args(sp):
+        sp.add_argument("--cutoff", type=int, default=4,
+                        help="hour a play-day starts (default 4, so playing "
+                             "past midnight counts as the previous day)")
+        sp.add_argument("--max-gap", type=float, default=None,
+                        help="also split a day into separate sessions when "
+                             "there is a gap of this many minutes between clips")
+        sp.add_argument("--scheme", default="day{session}_{n}",
+                        help="naming scheme; {session} {n} {date}")
+
+    p = sub.add_parser("sessions", help="group replays into play sessions")
+    _session_args(p)
+    p.set_defaults(func=cmd_sessions)
+
+    p = sub.add_parser("batch",
+                       help="rename and prepare a whole session in one go")
+    _session_args(p)
+    p.add_argument("--session", type=int,
+                   help="session number (default: all of them)")
+    p.add_argument("--seconds", type=float, default=20.0,
+                   help="video length per clip (default 20)")
+    p.add_argument("--max-speedup", type=float, default=30.0,
+                   help="cap the timelapse rate by taking a centred slice of "
+                        "long replays (default 30; 0 to use whole replays)")
+    p.add_argument("--rename", action="store_true",
+                   help="rename to the scheme first (names are baked into the "
+                        "render queue, so this must happen before preparing)")
+    p.add_argument("--radius", type=float, default=12.0)
+    p.add_argument("--height", type=float, default=6.0)
+    p.add_argument("--revolutions", type=float, default=0.5)
+    p.add_argument("--keyframes", type=int, default=90)
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_batch)
 
     p = sub.add_parser("tracks", help="list entity tracks in a replay")
     p.add_argument("replay", nargs="?")
