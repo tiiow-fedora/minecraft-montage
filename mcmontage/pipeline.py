@@ -81,7 +81,16 @@ def plan_replay(
             f"reports duration={replay_len}ms"
         )
 
+    if start < 0:
+        raise PipelineError(f"replay span starts before the recording (start={start}ms)")
+    if replay_len and end > replay_len:
+        raise PipelineError(
+            f"replay span ends after the recording (end={end}ms, the replay "
+            f"is {replay_len}ms long)"
+        )
     duration_ms = int(seconds * 1000)
+    if duration_ms <= 0:
+        raise PipelineError(f"video length must be positive (got {seconds}s)")
     speedup = tl_mod.speedup_factor(start, end, duration_ms)
     tp = tl_mod.time_path(start, end, duration_ms)
 

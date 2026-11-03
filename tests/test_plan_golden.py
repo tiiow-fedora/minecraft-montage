@@ -164,3 +164,26 @@ def test_minecraft_running_false_without_tasklist():
     import shutil
     if shutil.which("tasklist") is None:
         assert mod.minecraft_running() is False
+
+
+@pytest.mark.parametrize("kw,msg", [
+    (dict(seconds=0), "positive"),
+    (dict(seconds=-5), "positive"),
+    (dict(seconds=0.0004), "positive"),
+    (dict(start=-1), "before the recording"),
+    (dict(end=600_001), "after the recording"),
+    (dict(start=700_000, end=800_000), "after the recording"),
+])
+def test_out_of_range_requests_are_rejected_without_writing(tmp_path, cfg, kw, msg):
+    mcpr = syn.make_mcpr(tmp_path / "a.mcpr", duration_ms=600_000)
+    before = mcpr.read_bytes()
+    with pytest.raises(pipeline.PipelineError, match=msg):
+        pipeline.plan_replay(cfg, mcpr, follow=False, centre=(0, 64, 0),
+                             log=lambda m: None, **kw)
+    assert mcpr.read_bytes() == before
+
+
+def test_span_exactly_the_whole_replay_is_accepted(tmp_path, cfg):
+    mcpr = syn.make_mcpr(tmp_path / "a.mcpr", duration_ms=600_000)
+    pipeline.plan_replay(cfg, mcpr, start=0, end=600_000, follow=False,
+                         centre=(0, 64, 0), log=lambda m: None)
