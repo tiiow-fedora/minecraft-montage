@@ -20,7 +20,7 @@ def test_config_load_overrides(tmp_path):
     p = tmp_path / "c.toml"
     p.write_text('[paths]\nprofile="%s"\nrecordings="%s"\n[render]\nfps=30\n'
                  '[video]\nxfade=2.5\ncrf=23\n'
-                 % (tmp_path / "prof", tmp_path / "rec"))
+                 % ((tmp_path / "prof").as_posix(), (tmp_path / "rec").as_posix()))
     c = config.load(p)
     assert c.recordings == tmp_path / "rec"
     assert c.videos == tmp_path / "prof" / "replay_videos"

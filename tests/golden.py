@@ -55,9 +55,10 @@ def norm_tmp(value, tmp):
         return [norm_tmp(v, tmp) for v in value]
     tmp = str(tmp)
     spellings = {tmp, tmp.replace("\\", "/"),
-                 tmp.replace("\\", "/").replace(":", "\\:")}
+                 tmp.replace("\\", "/").replace(":", "\\:"),
+                 tmp.replace("\\", "\\\\")}          # JSON-escaped
     for sp in sorted(spellings, key=len, reverse=True):
         value = value.replace(sp, "<TMP>")
     # path remainder after <TMP>: separators are not significant
     return re.sub(r"<TMP>[^\s\"',;\[\]]*",
-                  lambda m: m.group(0).replace("\\", "/"), value)
+                  lambda m: re.sub(r"\\+", "/", m.group(0)), value)
