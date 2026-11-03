@@ -112,6 +112,8 @@ def cmd_inspect(args):
 
 
 def cmd_plan(args):
+    from . import tracks as tracks_mod
+
     cfg = config_mod.load(args.config)
     path = _pick_replay(cfg, args.replay)
     centre = (args.x, args.y, args.z)
@@ -131,7 +133,8 @@ def cmd_plan(args):
             revolutions=args.revolutions, keyframes=args.keyframes,
             out_file=args.out, append=args.append,
         )
-    except pipeline_mod.PipelineError as e:
+    except (pipeline_mod.PipelineError, replay_mod.ReplayError,
+            tracks_mod.TrackError) as e:
         raise SystemExit(str(e))
 
     print("speed-up    : x%.1f" % summary["speedup"])

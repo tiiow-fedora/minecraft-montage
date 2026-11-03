@@ -237,6 +237,7 @@ def batch_prepare(
     replay should not cost you the other five. Returns (results, failures).
     """
     from . import sessions as sessions_mod
+    from . import tracks as tracks_mod
 
     if minecraft_running():
         raise PipelineError(
@@ -274,7 +275,8 @@ def batch_prepare(
                 log=lambda m: log("  " + m), **camera
             )
             results.append(summary)
-        except (PipelineError, replay_mod.ReplayError, OSError) as exc:
+        except (PipelineError, replay_mod.ReplayError, tracks_mod.TrackError,
+                OSError) as exc:
             log("  FAILED: %s" % exc)
             failures.append((path, str(exc)))
 
