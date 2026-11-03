@@ -7,7 +7,15 @@
     python -m mcmontage highlights [REPLAY] detect highlights
     python -m mcmontage autoplan [REPLAY]   camera shots for the best highlights
     python -m mcmontage assemble CLIP...    transitions + beat-synced cuts
-    python -m mcmontage queue ACTION        batch queue status/retry/prune/reset
+    python -m mcmontage queue ACTION [ID]   persistent batch job queue:
+        status | retry | prune | reset      inspect / maintain
+        enqueue [--session N] [--upload]    queue plan -> render -> edit [-> upload]
+                                            for a play session (idempotent;
+                                            --dry-run shows what would be queued)
+        run [--stop-on-error]               execute the queue; Ctrl-C stops
+                                            cleanly after the current step
+        cancel ID | resume ID | requeue ID  steer one job (resume = "I did the
+                                            manual render step")
     python -m mcmontage upload VIDEO ...    upload (lands private)
 """
 
@@ -16,7 +24,10 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import signal
 import sys
+import threading
+import time
 from pathlib import Path
 
 from . import config as config_mod
@@ -244,20 +255,167 @@ def cmd_assemble(args):
         print(edit_mod.describe_command(argv))
 
 
+def _queue_progress(event, job):
+    info = ""
+    if event in ("retry", "failed") and job.error:
+        info = "  " + job.error.splitlines()[0][:160]
+    elif event == "waiting":
+        info = "  " + (job.message or "manual step")
+    elif event == "skipped":
+        info = "  " + (job.error or "")
+    subject = ""
+    clip = job.params.get("clip") or job.params.get("replay")
+    if clip:
+        subject = "  " + Path(str(clip)).name
+    print("[%-7s] %s %-11s%s%s" % (event, job.id, job.kind, subject, info))
+    sys.stdout.flush()
+
+
+def _print_report(report):
+    print()
+    print("done %d  failed %d  skipped %d  waiting %d  retried %d%s" % (
+        len(report.done), len(report.failed), len(report.skipped),
+        len(report.waiting), len(report.retried),
+        "  (stopped early)" if report.stopped else ""))
+    for label, ids in (("failed", report.failed), ("skipped", report.skipped),
+                       ("waiting", report.waiting)):
+        if ids:
+            print("  %-8s %s" % (label, ", ".join(ids)))
+    if report.waiting:
+        print("Waiting jobs need a manual step (e.g. render in Minecraft). "
+              "Do it, then run `queue run` again, or `queue resume ID`.")
+
+
+def _queue_run(cfg, q, args):
+    from . import jobqueue as jq
+    from . import queue_handlers
+
+    registry = queue_handlers.build_registry(cfg)
+    stop = {"asked": False}
+
+    def should_stop():
+        return stop["asked"]
+
+    def sleep(seconds):
+        end = time.monotonic() + seconds
+        while not stop["asked"] and time.monotonic() < end:
+            time.sleep(min(0.5, max(0.0, end - time.monotonic())))
+
+    def on_sigint(signum, frame):
+        if stop["asked"]:
+            raise KeyboardInterrupt
+        stop["asked"] = True
+        print("\nStopping after the current step (Ctrl-C again to abort now)...")
+
+    previous = None
+    if threading.current_thread() is threading.main_thread():
+        previous = signal.signal(signal.SIGINT, on_sigint)
+    try:
+        report = q.run(
+            registry, stop_on_error=args.stop_on_error,
+            progress=_queue_progress, should_stop=should_stop, sleep=sleep,
+            log=lambda m: print("    " + str(m)))
+    except KeyboardInterrupt:
+        print("\ninterrupted; the running job was returned to pending")
+        raise SystemExit(130)
+    except (jq.LockHeldError, jq.UnknownKindError) as e:
+        raise SystemExit(str(e))
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGINT, previous)
+    _print_report(report)
+    if report.failed:
+        raise SystemExit(1)
+    return report
+
+
+def _queue_enqueue(cfg, q, args):
+    from . import jobqueue as jq
+
+    groups = _sessions(cfg, args)
+    chosen = [s for s in groups if args.session in (None, s.index)]
+    if not chosen:
+        raise SystemExit("no session %s; run `mcmontage sessions` to list them"
+                         % args.session)
+    if args.upload and not (args.title or "").strip():
+        raise SystemExit("--upload needs --title")
+    if args.out and len(chosen) > 1:
+        raise SystemExit("--out names one file; pick a single session with --session")
+    music = args.music or []
+    if music:
+        try:
+            pipeline_mod.resolve_tracks(music)
+        except music_mod.MusicError as e:
+            raise SystemExit(str(e))
+    max_speedup = args.max_speedup or None
+    camera = {"radius": args.radius, "height": args.height,
+              "revolutions": args.revolutions, "keyframes": args.keyframes}
+    tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else []
+
+    for s in chosen:
+        clips = [c.path for c in s.clips]
+        title = args.title
+        print("session %d (%s): %d clip(s)" % (s.index, s.day, len(clips)))
+        if args.dry_run:
+            for c in s.clips:
+                start, end = pipeline_mod.centred_span(
+                    c.duration_ms, args.seconds, max_speedup)
+                span = (c.duration_ms if start is None else end - start) / 60000.0
+                print("  would queue plan + render_wait  %-18s %.1f min -> %.0fs"
+                      % (c.path.name, span, args.seconds))
+            print("  would queue edit   title=%r music=%s output=%s"
+                  % (title, ",".join(music) or "-", args.out or "(default)"))
+            if args.upload:
+                print("  would queue upload (private) title=%r" % title)
+            continue
+        before = {j.id for j in q.jobs()}
+        try:
+            batch = jq.enqueue_session_batch(
+                q, clips, args.seconds, max_speedup=max_speedup, camera=camera,
+                output=args.out, title=title, subtitle=args.subtitle,
+                music_ids=music, xfade=args.xfade, upload=args.upload,
+                description=args.description or "", tags=tags)
+        except jq.QueueError as e:
+            raise SystemExit(str(e))
+        jobs = batch.plans + batch.renders + [batch.edit] + (
+            [batch.upload] if batch.upload else [])
+        new = [j for j in jobs if j.id not in before]
+        print("  queued %d new job(s), %d already queued: %s"
+              % (len(new), len(jobs) - len(new), ", ".join(j.id for j in jobs)))
+    if args.dry_run:
+        print("--- dry run, nothing queued ---")
+    else:
+        print("Next: `queue run` (it will pause at each render for you to do "
+              "the Minecraft step).")
+
+
 def cmd_queue(args):
     from . import jobqueue as jq
 
     cfg = config_mod.load(args.config)
     q = jq.JobQueue(jq.default_queue_path(cfg))
-    if args.action == "status":
+    action = args.action
+    if action == "status":
         print(q.format_status())
-    elif args.action == "retry":
+    elif action == "retry":
         print("revived %d job(s)" % len(q.retry_failed()))
-    elif args.action == "prune":
+    elif action == "prune":
         print("pruned %d job(s)" % q.prune_done())
-    elif args.action == "reset":
+    elif action == "reset":
         q.reset()
         print("queue cleared")
+    elif action == "run":
+        _queue_run(cfg, q, args)
+    elif action == "enqueue":
+        _queue_enqueue(cfg, q, args)
+    elif action in ("cancel", "resume", "requeue"):
+        if not args.job_id:
+            raise SystemExit("queue %s needs a job id (see `queue status`)" % action)
+        try:
+            job = getattr(q, action)(args.job_id)
+        except jq.QueueError as e:
+            raise SystemExit(str(e))
+        print("%s: %s is now %s" % (action, job.id, job.status))
 
 
 def _sessions(cfg, args):
@@ -478,8 +636,35 @@ def main(argv=None):
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_assemble)
 
-    p = sub.add_parser("queue", help="inspect or maintain the batch job queue")
-    p.add_argument("action", choices=("status", "retry", "prune", "reset"))
+    p = sub.add_parser("queue", help="persistent batch job queue")
+    p.add_argument("action", choices=("status", "retry", "prune", "reset", "run",
+                                      "enqueue", "cancel", "resume", "requeue"))
+    p.add_argument("job_id", nargs="?", help="job id for cancel/resume/requeue")
+    p.add_argument("--stop-on-error", action="store_true",
+                   help="run: stop at the first job that exhausts its retries")
+    _session_args(p)
+    p.add_argument("--session", type=int,
+                   help="enqueue: session number (default: all, one chain each)")
+    p.add_argument("--seconds", type=float, default=20.0,
+                   help="enqueue: video length per clip (default 20)")
+    p.add_argument("--max-speedup", type=float, default=30.0,
+                   help="enqueue: cap the timelapse rate (default 30; 0 = whole replays)")
+    p.add_argument("--radius", type=float, default=12.0)
+    p.add_argument("--height", type=float, default=6.0)
+    p.add_argument("--revolutions", type=float, default=0.5)
+    p.add_argument("--keyframes", type=int, default=90)
+    p.add_argument("--upload", action="store_true",
+                   help="enqueue: also queue a PRIVATE YouTube upload (needs --title)")
+    p.add_argument("--title")
+    p.add_argument("--subtitle")
+    p.add_argument("--description", default="")
+    p.add_argument("--tags", default="", help="comma-separated upload tags")
+    p.add_argument("--xfade", type=float)
+    p.add_argument("--out", help="enqueue: finished video path")
+    p.add_argument("--music", action="append", default=None,
+                   help="enqueue: track id; repeat for several")
+    p.add_argument("--dry-run", action="store_true",
+                   help="enqueue: print what would be queued, change nothing")
     p.set_defaults(func=cmd_queue)
 
     p = sub.add_parser("edit",
