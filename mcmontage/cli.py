@@ -378,6 +378,9 @@ def main(argv=None):
     p.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     p.set_defaults(func=cmd_upload)
 
+    from . import cli_extras
+    cli_extras.register(sub)
+
     args = ap.parse_args(argv)
     return args.func(args)
 
