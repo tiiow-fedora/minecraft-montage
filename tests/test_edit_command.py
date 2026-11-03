@@ -154,3 +154,21 @@ def test_esc_path_windows():
 
 def test_esc_path_apostrophe_closes_and_reopens_quote():
     assert edit._esc_path("/home/O'Brien/x") == "/home/O'\\\\\\''Brien/x"
+
+
+def test_xfade_zero_uses_concat_not_xfade(tmp_path, fake_probe):
+    fake_probe("a.mp4", 5.0); fake_probe("b.mp4", 5.0)
+    args = build(tmp_path, mk(tmp_path, "a.mp4", "b.mp4"), xfade=0)
+    g = args[args.index("-filter_complex") + 1]
+    assert "concat=n=2:v=1:a=0" in g and "xfade=" not in g
+    assert args[args.index("-t") + 1] == "10.000"
+
+
+def test_music_crossfade_is_capped_for_short_videos(tmp_path, fake_probe):
+    fake_probe("a.mp4", 2.0)
+    ms = []
+    for i in range(3):
+        m = tmp_path / f"m{i}.mp3"; m.write_bytes(b"x"); ms.append(m)
+    args = build(tmp_path, mk(tmp_path, "a.mp4"), music=ms, music_xfade=3.0)
+    g = args[args.index("-filter_complex") + 1]
+    assert "acrossfade=d=1.0" in g and "acrossfade=d=3.0" not in g

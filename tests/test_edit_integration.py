@@ -138,3 +138,30 @@ def test_ffmpeg_failure_is_reported_as_edit_error(tmp_path):
     bad.write_bytes(b"garbage")
     with pytest.raises(edit.EditError):
         edit.build([bad], tmp_path / "o.mp4")
+
+
+def test_xfade_zero_is_a_hard_cut_not_a_dropped_clip(tmp_path):
+    a = syn.make_clip(tmp_path / "a.mp4", seconds=2)
+    b = syn.make_clip(tmp_path / "b.mp4", seconds=2, pattern="testsrc")
+    out = tmp_path / "final.mp4"
+    edit.build([a, b], out, xfade=0, crf=35, preset="ultrafast")
+    assert edit.probe(out).duration == pytest.approx(4, abs=0.3)
+
+
+def test_short_video_with_several_tracks_does_not_hang(tmp_path):
+    """share per track < music_xfade used to make acrossfade spin forever."""
+    import subprocess
+    real_run = subprocess.run
+
+    def run_with_timeout(*a, **kw):
+        kw.setdefault("timeout", 60)
+        return real_run(*a, **kw)
+
+    a = syn.make_clip(tmp_path / "a.mp4", seconds=2)
+    tracks = [syn.make_tone(tmp_path / f"m{i}.wav", 5) for i in range(3)]
+    out = tmp_path / "final.mp4"
+    import unittest.mock as mock
+    with mock.patch.object(edit.subprocess, "run", run_with_timeout):
+        edit.build([a], out, music=tracks, crf=35, preset="ultrafast")
+    p = edit.probe(out)
+    assert p.has_audio and p.duration == pytest.approx(2, abs=0.4)
