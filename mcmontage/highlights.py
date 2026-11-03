@@ -137,6 +137,43 @@ def _clean(track: Track | None) -> Track | None:
     return Track(track.entity_id, pts)
 
 
+class _Sampler:
+    """Fast ``Track.at`` for a cleaned track.
+
+    ``Track.at`` rebuilds the full time list on every call (O(n) each), which
+    makes grid resampling of a long replay quadratic. This caches it once.
+    """
+
+    def __init__(self, tr: Track):
+        self.pts = tr.points
+        self.times = [p[0] for p in tr.points]
+
+    def at(self, ts: float) -> tuple:
+        pts = self.pts
+        if ts <= self.times[0]:
+            return tuple(pts[0][1:4])
+        if ts >= self.times[-1]:
+            return tuple(pts[-1][1:4])
+        i = bisect.bisect_right(self.times, ts)
+        a, b = pts[i - 1], pts[i]
+        span = b[0] - a[0]
+        f = 0.0 if span == 0 else (ts - a[0]) / span
+        return tuple(a[j] + (b[j] - a[j]) * f for j in (1, 2, 3))
+
+
+def _pos3(pos) -> tuple | None:
+    """Event position as a finite (x, y, z) tuple, or None if unusable."""
+    if not pos:
+        return None
+    try:
+        v = tuple(float(c) for c in tuple(pos)[:3])
+    except (TypeError, ValueError):
+        return None
+    if len(v) < 3 or not all(math.isfinite(c) for c in v):
+        return None
+    return v
+
+
 def _dist(a, b) -> float:
     return math.dist(a[1:4], b[1:4])
 
@@ -173,7 +210,8 @@ def _grid(tr: Track, cfg: DetectConfig):
     t0, t1 = tr.start, tr.end
     n = int((t1 - t0) // step) + 1
     times = [t0 + i * step for i in range(n)]
-    pos = [tr.at(t) for t in times]
+    smp = _Sampler(tr)
+    pos = [smp.at(t) for t in times]
     bad = [False] * max(0, n - 1)
     for ta, tb in _teleport_intervals(tr, cfg):
         lo = int((ta - t0) // step)
@@ -191,6 +229,23 @@ def _runs(indices: Sequence[int], max_gap: int = 1) -> list[tuple[int, int]]:
             runs[-1] = (runs[-1][0], i)
         else:
             runs.append((i, i))
+    return runs
+
+
+def _fall_runs(falling: Sequence[int], bad: Sequence[bool]) -> list[tuple[int, int]]:
+    """Like ``_runs(falling, 2)`` but a bridged step may not be a teleport step.
+
+    Bridging a non-falling step tolerates a bounce; bridging a teleport would
+    add the teleport's vertical jump into the "drop".
+    """
+    runs: list[tuple[int, int]] = []
+    for i in falling:
+        if runs:
+            gap = i - runs[-1][1]
+            if gap == 1 or (gap == 2 and not bad[i - 1]):
+                runs[-1] = (runs[-1][0], i)
+                continue
+        runs.append((i, i))
     return runs
 
 
@@ -225,12 +280,13 @@ def detect_deaths(tracks: Mapping[int, Track], player_id: int | None,
 
     out: list[Highlight] = []
     if observed:
+        smp = _Sampler(tr) if tr else None
         last_t = None
         for e in observed:
             if last_t is not None and e.t - last_t < cfg.death_dedupe_ms:
                 continue
             last_t = e.t
-            pos = tuple(e.pos) if e.pos else (tuple(tr.at(e.t)) if tr else None)
+            pos = _pos3(e.pos) or (smp.at(e.t) if smp else None)
             out.append(Highlight("death", int(e.t), int(e.t) + 1, 1.0,
                                  entity=player_id, pos=pos,
                                  label=f"Death at {_fmt(e.t)}",
@@ -240,9 +296,12 @@ def detect_deaths(tracks: Mapping[int, Track], player_id: int | None,
     if tr is None:
         return []
     pts = tr.points
+    last_inferred = None
     for i in range(1, len(pts)):
         a, b = pts[i - 1], pts[i]
         if _dist(a, b) < cfg.respawn_teleport_blocks:
+            continue
+        if last_inferred is not None and a[0] - last_inferred < cfg.death_dedupe_ms:
             continue
         gap = (b[0] - a[0]) >= cfg.death_gap_ms
         peak = a[2]
@@ -255,6 +314,7 @@ def detect_deaths(tracks: Mapping[int, Track], player_id: int | None,
             continue
         score = cfg.death_inferred_confidence + (0.1 if gap and fall else 0.0)
         t = int(a[0])
+        last_inferred = a[0]
         out.append(Highlight("death", t, t + 1, _clamp01(score),
                              entity=player_id, pos=tuple(a[1:4]),
                              label=f"Death at {_fmt(t)} (inferred)",
@@ -290,7 +350,7 @@ def detect_kills(events: Iterable[Event], player_id: int | None,
     out = []
     for g in groups:
         n = len(g)
-        pos = next((tuple(e.pos) for e in reversed(g) if e.pos), None)
+        pos = next((p for p in (_pos3(e.pos) for e in reversed(g)) if p), None)
         out.append(Highlight(
             "kill", int(g[0].t), int(g[-1].t) + 1,
             _clamp01(cfg.kill_base_score + cfg.kill_streak_bonus * (n - 1)),
@@ -363,7 +423,7 @@ def detect_rapid_movement(track: Track, cfg: DetectConfig | None = None
     dt_s = step / 1000.0
     falling = [k for k in range(n - 1)
                if not bad[k] and (pos[k][1] - pos[k + 1][1]) / dt_s >= cfg.fall_min_vspeed]
-    for first, last in _runs(falling, 2):
+    for first, last in _fall_runs(falling, bad):
         drop = pos[first][1] - pos[last + 1][1]
         if drop < cfg.fall_min_drop:
             continue
@@ -417,19 +477,20 @@ def _builds_from_events(places: list[Event], eid, cfg: DetectConfig) -> list[Hig
     cur: dict | None = None
     for e in places:
         joins = False
+        ep = _pos3(e.pos)
         if cur is not None and e.t - cur["evs"][-1].t <= cfg.build_gap_ms:
-            if e.pos is None or cur["n"] == 0:
+            if ep is None or cur["n"] == 0:
                 joins = True
             else:
                 c = [s / cur["n"] for s in cur["sum"]]
-                joins = math.dist(c, e.pos[:3]) <= cfg.build_radius
+                joins = math.dist(c, ep) <= cfg.build_radius
         if not joins:
             cur = {"evs": [], "sum": [0.0, 0.0, 0.0], "n": 0}
             clusters.append(cur)
         cur["evs"].append(e)
-        if e.pos is not None:
+        if ep is not None:
             for k in range(3):
-                cur["sum"][k] += float(e.pos[k])
+                cur["sum"][k] += ep[k]
             cur["n"] += 1
     out = []
     for c in clusters:
@@ -538,10 +599,20 @@ def _merge_same_kind(hs: list[Highlight]) -> list[Highlight]:
             best = max(b, key=lambda h: (h.score, -h.start_ms))
             meta = dict(best.meta)
             meta["merged"] = len(b)
+            label = best.label
+            if best.kind == "kill" and all("kills" in h.meta for h in b):
+                n = sum(int(h.meta["kills"]) for h in b)
+                meta["kills"] = n
+                meta["targets"] = [t for h in b for t in h.meta.get("targets", [])]
+                label = _STREAK_NAMES.get(n, f"{n}-kill streak")
+            elif best.kind == "build" and all("blocks" in h.meta for h in b):
+                n = sum(int(h.meta["blocks"]) for h in b)
+                meta["blocks"] = n
+                label = f"Build ({n} blocks)"
             out.append(Highlight(best.kind, min(h.start_ms for h in b),
                                  max(h.end_ms for h in b), best.score,
                                  entity=best.entity, pos=best.pos,
-                                 label=best.label, meta=meta))
+                                 label=label, meta=meta))
     return out
 
 
@@ -560,7 +631,9 @@ def detect_all(tracks: Mapping[int, Track] | Iterable[Track],
     cfg = cfg or DEFAULT_CONFIG
     if not isinstance(tracks, Mapping):
         tracks = {t.entity_id: t for t in tracks}
-    tracks = {k: t for k, t in tracks.items() if _clean(t) is not None}
+    cleaned = {k: c for k, c in ((k, _clean(t)) for k, t in tracks.items())
+               if c is not None}
+    tracks = {k: tracks[k] for k in cleaned}
     evs = _as_events(events)
 
     if player_id is None and tracks:
@@ -576,10 +649,15 @@ def detect_all(tracks: Mapping[int, Track] | Iterable[Track],
     if ptrack is not None:
         raw += detect_rapid_movement(ptrack, cfg)
         raw += detect_builds(ptrack, evs, cfg)
+    elif player_id is not None:
+        # No usable track for the player, but placement events need none.
+        places = [e for e in evs if e.kind == "block_place"
+                  and (e.entity is None or e.entity == player_id)]
+        raw += _builds_from_events(places, player_id, cfg) if places else []
 
-    if tracks:
-        lo = min(_clean(t).start for t in tracks.values())
-        hi = max(_clean(t).end for t in tracks.values())
+    if cleaned:
+        lo = min(c.start for c in cleaned.values())
+        hi = max(c.end for c in cleaned.values())
     else:
         lo, hi = 0, math.inf
 
@@ -619,18 +697,28 @@ def select(highlights: Iterable[Highlight], target_ms: int,
     if target_ms <= 0 or (max_count is not None and max_count <= 0):
         return []
     gap = max(0, int(min_gap_ms))
-    order = sorted(highlights, key=lambda h: (-h.score, h.start_ms, h.duration_ms, h.kind))
-    chosen: list[Highlight] = []
+
+    def rank(h):
+        sc = h.score if h.score == h.score else -math.inf  # NaN sorts last
+        return (-sc, h.start_ms, h.duration_ms, h.kind)
+
+    order = sorted(highlights, key=rank)
+    chosen: list[Highlight] = []   # kept sorted by start; mutually non-overlapping
+    starts: list[int] = []
     used = 0
     for h in order:
         if max_count is not None and len(chosen) >= max_count:
             break
         if used + h.duration_ms > target_ms:
             continue
-        if any(h.start_ms < c.end_ms + gap and c.start_ms < h.end_ms + gap
-               for c in chosen):
+        # Chosen spans are disjoint, so only the neighbours can conflict.
+        i = bisect.bisect_left(starts, h.start_ms)
+        if i > 0 and h.start_ms < chosen[i - 1].end_ms + gap:
             continue
-        chosen.append(h)
+        if i < len(chosen) and chosen[i].start_ms < h.end_ms + gap:
+            continue
+        chosen.insert(i, h)
+        starts.insert(i, h.start_ms)
         used += h.duration_ms
     chosen.sort(key=lambda h: (h.start_ms, h.end_ms, h.kind))
     return chosen

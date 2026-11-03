@@ -556,3 +556,245 @@ def test_load_bad_entry_raises(tmp_path):
 def test_load_missing_file_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         load_highlights(tmp_path / "nope.json")
+
+
+# ================================================================ review additions
+import random
+import time
+
+from mcmontage.highlights import _merge_same_kind
+
+
+def _long_track(n=72000, dt=50, seed=1):
+    """~1h at 20 samples/s: walking, sprint bursts, falls, fidgeting, teleports."""
+    r = random.Random(seed)
+    pts = []
+    x = z = 0.0
+    y = 64.0
+    for i in range(n):
+        t = i * dt
+        phase = (i // 2000) % 5
+        if phase == 1:      # fast travel
+            x += 0.9
+        elif phase == 2:    # fall then reset
+            y -= 0.4 if y > 0 else -50
+        elif phase == 3:    # fidget in place
+            x += r.uniform(-0.05, 0.05)
+            z += r.uniform(-0.05, 0.05)
+        else:
+            x += r.uniform(-0.1, 0.25)
+            z += r.uniform(-0.1, 0.1)
+        pts.append((t, x, y, z, r.uniform(-180, 180) if phase == 3 else 0.0,
+                    r.uniform(-30, 30) if phase == 3 else 0.0))
+    return Track(P, pts)
+
+
+def test_perf_one_hour_replay_detectors():
+    tr = _long_track()
+    evs = ([Event(i * 5000, "kill", P, (i, 64, 0), target=i) for i in range(600)]
+           + [Event(i * 700, "block_place", P, (i % 40, 64, 0)) for i in range(4000)])
+    t0 = time.perf_counter()
+    rapid = detect_rapid_movement(tr)
+    t_rapid = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    allh = detect_all({P: tr}, evs, P)
+    t_all = time.perf_counter() - t0
+    assert t_rapid < 2.0, t_rapid
+    assert t_all < 4.0, t_all
+    assert any(h.kind == "speed" for h in rapid)      # the data really exercises it
+    assert any(h.kind == "fall" for h in rapid)
+    all_finite(allh)
+
+
+def test_perf_builds_from_track_fallback_long():
+    tr = _long_track()
+    t0 = time.perf_counter()
+    detect_builds(tr)
+    assert time.perf_counter() - t0 < 2.0
+
+
+def test_perf_select_many_highlights():
+    hs = [hl("kill", i * 10000, i * 10000 + 3000, (i % 97) / 100) for i in range(20000)]
+    t0 = time.perf_counter()
+    out = select(hs, 10**9, min_gap_ms=0)
+    assert time.perf_counter() - t0 < 1.5
+    assert len(out) == 20000
+
+
+def test_fall_not_bridged_across_teleport():
+    # Two 10-block falls separated by a 45-block downward teleport: neither is a
+    # 12-block fall, and the teleport's drop must not be counted as falling.
+    def fn(t):
+        if t <= 1000:
+            return (0, 200 - 10 * t / 1000, 0, 0.0, 0.0)
+        if t <= 2000:
+            return (0, 145 - 10 * (t - 1000) / 1000, 0, 0.0, 0.0)
+        return (0, 135, 0, 0.0, 0.0)
+    tr = mk(P, 0, 4000, fn)
+    assert [h for h in detect_rapid_movement(tr) if h.kind == "fall"] == []
+
+
+def test_event_positions_non_finite_or_short_never_leak():
+    nan = float("nan")
+    evs = [Event(1000 + i * 300, "block_place", P, (nan, 64, 0) if i % 2 else (1.0, 64)) for i in range(15)]
+    evs += [Event(1000, "kill", P, (nan, 0, 0))]
+    evs += [Event(5000, "death", P, (float("inf"), 0, 0))]
+    out = detect_all({P: still()}, evs, P)
+    assert out
+    all_finite(out)
+    json.dumps([h.to_json() for h in out], allow_nan=False)
+
+
+def test_inferred_deaths_deduped():
+    # Two gap+teleport respawns 1.5s apart are one death (death_dedupe_ms=2000).
+    pts = [(0, 0, 64, 0, 0, 0), (1500, 0, 64, 0, 0, 0), (3000, 0, 64, 0, 0, 0),
+           (4500, 100, 64, 0, 0, 0), (5500, 0, 64, 0, 0, 0), (9000, 0, 64, 0, 0, 0)]
+    out = detect_deaths({P: Track(P, pts)}, P, [], CFG)
+    assert len(out) == 1 and out[0].start_ms == 3000
+
+
+def test_detect_all_block_place_events_without_usable_player_track():
+    evs = [Event(1000 + i * 400, "block_place", P, (5, 64, 5)) for i in range(20)]
+    other = still(eid=7, t0=0, t1=60000)
+    out = detect_all({7: other, P: Track(P, [(0, 0, 0, 0, 0, 0)])}, evs, P)
+    assert [h.kind for h in out] == ["build"]
+
+
+def test_merge_kill_streaks_sums_kills_and_targets():
+    a = hl("kill", 0, 5000, 0.6, entity=P, label="Double kill",
+           meta={"kills": 2, "targets": [1, 2]})
+    b = hl("kill", 4000, 9000, 0.4, entity=P, label="Kill",
+           meta={"kills": 1, "targets": [3]})
+    (m,) = _merge_same_kind([a, b])
+    assert m.meta["kills"] == 3 and m.meta["targets"] == [1, 2, 3]
+    assert m.label == "Triple kill"
+    assert m.score == 0.6 and (m.start_ms, m.end_ms) == (0, 9000)
+
+
+def test_merge_builds_sums_blocks():
+    a = hl("build", 0, 5000, 0.5, entity=P, label="Build (12 blocks)", meta={"blocks": 12})
+    b = hl("build", 5000, 9000, 0.9, entity=P, label="Build (30 blocks)", meta={"blocks": 30})
+    (m,) = _merge_same_kind([a, b])   # touching spans merge
+    assert m.meta["blocks"] == 42 and m.label == "Build (42 blocks)" and m.score == 0.9
+
+
+def test_select_nan_score_is_ranked_last_and_stable():
+    nan = float("nan")
+    a = hl("kill", 0, 1000, nan)
+    b = hl("kill", 500, 1500, 0.1)
+    out = select([a, b], 10_000, min_gap_ms=0)
+    assert out == [b]
+
+
+# ---------------------------------------------------------------- property tests
+
+def _rand_events(r, n, tmax):
+    kinds = ["kill", "death", "block_place", "damage", "chat"]
+    out = []
+    for _ in range(n):
+        pos = None if r.random() < 0.3 else (r.uniform(-50, 50), r.uniform(0, 100), r.uniform(-50, 50))
+        out.append(Event(r.randrange(-5000, tmax + 5000), r.choice(kinds),
+                         r.choice([P, P, 2, None]), pos, target=r.choice([None, 5, 6])))
+    return out
+
+
+def _rand_track(r, eid, n, tmax):
+    pts = []
+    x = y = z = 0.0
+    for _ in range(n):
+        t = r.randrange(0, tmax)           # unsorted, duplicates possible
+        x += r.uniform(-30, 30) if r.random() < 0.05 else r.uniform(-1, 1)
+        y += r.uniform(-20, 20) if r.random() < 0.05 else r.uniform(-1, 1)
+        z += r.uniform(-1, 1)
+        v = [t, x, y, z, r.uniform(-400, 400), r.uniform(-90, 90)]
+        if r.random() < 0.02:
+            v[r.randrange(1, 4)] = r.choice([float("nan"), float("inf")])
+        pts.append(tuple(v))
+    return Track(eid, pts)
+
+
+@pytest.mark.parametrize("seed", range(25))
+def test_property_detect_all_invariants(seed):
+    r = random.Random(seed)
+    tmax = r.choice([5000, 60000, 300000])
+    tracks = {P: _rand_track(r, P, r.randrange(0, 1500), tmax),
+              2: _rand_track(r, 2, r.randrange(0, 300), tmax)}
+    evs = _rand_events(r, r.randrange(0, 80), tmax)
+    out = detect_all(tracks, evs, P)
+    again = detect_all(tracks, list(reversed(evs)), P)
+    assert out == again                                 # deterministic, order-insensitive
+    all_finite(out)
+    json.dumps([h.to_json() for h in out], allow_nan=False)
+    keys = [(h.start_ms, h.end_ms, h.kind) for h in out]
+    assert keys == sorted(keys)
+    usable = [t for t in tracks.values() if len([p for p in t.points
+              if all(math.isfinite(v) for v in p)]) >= 2]
+    if usable:
+        lo = min(min(p[0] for p in t.points if all(math.isfinite(v) for v in p)) for t in usable)
+        hi = max(max(p[0] for p in t.points if all(math.isfinite(v) for v in p)) for t in usable)
+    for h in out:
+        assert h.start_ms < h.end_ms
+        if usable:
+            assert lo <= h.start_ms and h.end_ms <= hi
+        assert type(h.start_ms) is int and type(h.end_ms) is int
+    # same-kind/entity spans never overlap after merging
+    by = {}
+    for h in out:
+        by.setdefault((h.kind, h.entity), []).append(h)
+    for hs in by.values():
+        for a, b in zip(hs, hs[1:]):
+            assert a.end_ms < b.start_ms
+
+
+@pytest.mark.parametrize("seed", range(25))
+def test_property_merge_preserves_union_and_max_score(seed):
+    r = random.Random(1000 + seed)
+    hs = []
+    for _ in range(r.randrange(1, 40)):
+        s = r.randrange(0, 5000)
+        hs.append(hl(r.choice(["kill", "death"]), s, s + r.randrange(1, 600),
+                     round(r.random(), 3), entity=r.choice([P, 2])))
+    out = _merge_same_kind(hs)
+    for key in {(h.kind, h.entity) for h in hs}:
+        src = [h for h in hs if (h.kind, h.entity) == key]
+        res = sorted((h for h in out if (h.kind, h.entity) == key), key=lambda h: h.start_ms)
+        for a, b in zip(res, res[1:]):
+            assert a.end_ms < b.start_ms
+        covered = lambda t, xs: any(h.start_ms <= t < h.end_ms for h in xs)
+        for t in range(0, 6000, 7):
+            assert covered(t, src) == covered(t, res) or any(
+                h.end_ms == t for h in src)  # touching spans bridge zero-width seams
+        assert max(h.score for h in src) == max(h.score for h in res)
+        assert sum(h.meta.get("merged", 1) for h in res) == len(src)
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_property_select_invariants(seed):
+    r = random.Random(2000 + seed)
+    hs = []
+    for _ in range(r.randrange(0, 60)):
+        s = r.randrange(0, 60000)
+        hs.append(hl("kill", s, s + r.randrange(1, 8000), r.random()))
+    target = r.choice([0, 1, 5000, 20000, 10**7])
+    gap = r.choice([0, 1, 2000, 5000])
+    mc = r.choice([None, 1, 3, 100])
+    out = select(hs, target, min_gap_ms=gap, max_count=mc)
+    assert set(map(id, out)) <= set(map(id, hs))
+    assert sum(h.duration_ms for h in out) <= target
+    if mc is not None:
+        assert len(out) <= mc
+    assert [h.start_ms for h in out] == sorted(h.start_ms for h in out)
+    for a, b in zip(out, out[1:]):
+        assert b.start_ms >= a.end_ms + gap
+    # greedy invariant: the best-scoring highlight that fits alone is always kept
+    fits = [h for h in hs if h.duration_ms <= target]
+    if fits and (mc is None or mc >= 1):
+        best = min(fits, key=lambda h: (-h.score, h.start_ms, h.duration_ms, h.kind))
+        assert best in out
+    # maximality: nothing rejected could have been added
+    if mc is None or len(out) < mc:
+        used = sum(h.duration_ms for h in out)
+        for h in hs:
+            if h in out or used + h.duration_ms > target:
+                continue
+            assert any(h.start_ms < c.end_ms + gap and c.start_ms < h.end_ms + gap for c in out)

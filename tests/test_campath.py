@@ -676,3 +676,242 @@ def test_plan_montage_round_trip_mcpr(tmp_path):
     assert replay.inspect(mcpr).has_render_queue
     with zipfile.ZipFile(mcpr) as zf:
         assert "recording.tmcpr" in zf.namelist()
+
+
+# ================================================================ review additions
+import random
+import time
+
+
+def _dist(eye, tgt):
+    return math.dist(eye, tgt)
+
+
+def test_safe_eye_respects_ceiling_and_min_distance_together():
+    # Target hugging the ceiling: the outward push must not leave the allowed band.
+    s = cp.Safety(max_y=100.0, min_distance=2.0)
+    for eye in [(0, 99.9, 0), (0, 100.0, 0), (0.0, 120.0, 0.0), (0, 99.5, 0)]:
+        tgt = (0.0, 99.5, 0.0)
+        x, y, z = cp._safe_eye(eye, tgt, s)
+        assert y <= 100.0 + 1e-9
+        assert _dist((x, y, z), tgt) >= 2.0 - 1e-6
+
+
+def test_safe_eye_respects_floor_and_ceiling_band_exhaustive():
+    r = random.Random(7)
+    for _ in range(2000):
+        lo = r.uniform(-70, 60)
+        hi = lo + r.choice([0.0, 0.5, 3.0, 50.0])
+        s = cp.Safety(min_y=lo, max_y=hi, min_distance=r.choice([0.0, 1.0, 2.0, 6.0]))
+        tgt = tuple(r.uniform(-5, 5) for _ in range(2)) + (r.uniform(lo - 5, hi + 5),)
+        tgt = (tgt[0], tgt[2], tgt[1])
+        eye = (tgt[0] + r.choice([0, 0, r.uniform(-3, 3)]), r.uniform(lo - 10, hi + 10),
+               tgt[2] + r.choice([0, r.uniform(-3, 3)]))
+        x, y, z = cp._safe_eye(eye, tgt, s)
+        assert lo - 1e-9 <= y <= hi + 1e-9
+        assert _dist((x, y, z), tgt) >= s.min_distance - 1e-6
+
+
+def test_safety_rejects_inverted_band():
+    with pytest.raises(cp.CamPathError):
+        cp.Safety(min_y=10.0, max_y=5.0)
+    with pytest.raises(cp.CamPathError):
+        cp.Safety(min_distance=float("nan"))
+
+
+def test_speed_profile_extreme_rates_stay_finite_and_monotone():
+    for rates in ([(1, 1e308), (1, 1e308)], [(1, 1e-300), (1, 1e300)],
+                  [(1, 1e-320), (1, 1)], [(1e-300, 1), (1e300, 1)]):
+        path = cp.speed_ramp(0, 100_000, 5000, rates)
+        ts = [k["properties"][timeline.PROP_TIMESTAMP] for k in path.keyframes]
+        tt = times(path)
+        assert ts[0] == 0 and ts[-1] == 100_000 and tt[0] == 0 and tt[-1] == 5000
+        assert all(b > a for a, b in zip(ts, ts[1:])) and all(b > a for a, b in zip(tt, tt[1:]))
+        json.dumps(path.to_json(), allow_nan=False)
+
+
+def test_speed_ramp_rejects_non_finite_blend():
+    for b in (float("inf"), float("nan")):
+        with pytest.raises(cp.CamPathError):
+            cp.speed_ramp(0, 1000, 1000, [(1, 1)], blend=b)
+
+
+def test_keyframes_must_be_integer():
+    with pytest.raises(cp.CamPathError):
+        cp.orbit_shot((0, 0, 0), 1000, keyframes=2.5)
+    with pytest.raises(cp.CamPathError):
+        cp.orbit_shot((0, 0, 0), 1000, keyframes=float("nan"))
+    with pytest.raises(cp.CamPathError):
+        cp.orbit_shot((0, 0, 0), 1000, keyframes=4.0)
+
+
+def test_overhead_pass_does_not_spin_yaw():
+    # radius 0 puts the eye straight above/below the target: yaw is undefined
+    # there and must not flip-flop between neighbouring keyframes.
+    p = cp.crane_shot((0, 0, 0), 1000, radius=0.0, start_height=5, end_height=-5,
+                      sweep_deg=0.0, keyframes=9, safety=cp.Safety(min_distance=0.5))
+    yaws = [r[0] for r in eyes_rots(p)[1]]
+    assert max(yaws) - min(yaws) < 1e-6
+    assert_valid(p)
+
+
+def test_no_negative_zero_in_output():
+    p = cp.orbit_shot((0, 0, 0), 1000, radius=0.0, height=5.0, keyframes=5,
+                      safety=cp.Safety(min_distance=0.5))
+    for k in p.keyframes:
+        for v in k["properties"][POS] + k["properties"][ROT]:
+            assert not (v == 0 and math.copysign(1, v) < 0)
+
+
+def test_follow_shot_long_track_is_fast_and_matches_short_window():
+    n = 72_000
+    pts = [(i * 50, i * 0.15, 64 + 3 * math.sin(i / 200), 5 * math.sin(i / 900), 0.0, 0.0)
+           for i in range(n)]
+    tr = Track(1, pts)
+    t0 = time.perf_counter()
+    path = cp.follow_shot(tr, 1_800_000, 1_812_000, 6000)
+    assert time.perf_counter() - t0 < 2.0
+    assert_valid(path)
+    # same shot against only the relevant slice of the replay must agree closely
+    sub = Track(1, [p for p in pts if 1_700_000 <= p[0] <= 1_900_000])
+    ref = cp.follow_shot(sub, 1_800_000, 1_812_000, 6000)
+    for a, b in zip(eyes_rots(path)[0], eyes_rots(ref)[0]):
+        assert math.dist(a, b) < 1.0
+
+
+def test_follow_shot_drops_non_finite_and_unsorted_points():
+    pts = [(i * 100, i * 0.2, 70.0, 0.0, 0.0, 0.0) for i in range(300)]
+    bad = list(reversed(pts)) + [(5000, float("nan"), 70.0, 0.0, 0.0, 0.0)]
+    a = cp.follow_shot(Track(1, bad), 5000, 15000, 4000)
+    b = cp.follow_shot(Track(1, pts), 5000, 15000, 4000)
+    assert eyes_rots(a)[0] == eyes_rots(b)[0]
+
+
+# ---------------------------------------------------------------- property tests
+
+def _rand_vec(r, spread=30.0):
+    return (r.uniform(-spread, spread), r.uniform(-20, 120), r.uniform(-spread, spread))
+
+
+def _rand_safety(r):
+    lo = r.choice([-64.0, 0.0, 60.0, r.uniform(-64, 80)])
+    hi = r.choice([None, lo + r.choice([0.0, 1.0, 10.0, 300.0])])
+    return cp.Safety(min_y=lo, max_y=hi, min_distance=r.choice([0.0, 0.5, 2.0, 8.0]))
+
+
+def _rand_shot(r):
+    dur = r.choice([1, 2, 3, 7, 50, 1000, 5000, 60_000])
+    kf = r.choice([2, 3, 5, 24, 90])
+    safety = _rand_safety(r)
+    ease = r.choice(sorted(cp.EASINGS))
+    common = dict(keyframes=kf, safety=safety)
+    tgt = r.choice([(0.0, 64.0, 0.0), _rand_vec(r)])
+    which = r.choice(["orbit", "dolly", "crane", "flyby", "static"])
+    if which == "orbit":
+        p = cp.orbit_shot(tgt, dur, radius=r.choice([0.0, 0.1, 5.0, 40.0]),
+                          end_radius=r.choice([None, 0.0, 3.0]),
+                          height=r.uniform(-10, 20), end_height=r.choice([None, -5.0, 30.0]),
+                          revolutions=r.uniform(-3, 3), start_angle_deg=r.uniform(-720, 720),
+                          easing=ease, **common)
+        tg = None
+    elif which == "dolly":
+        s, e = _rand_vec(r), r.choice([tgt, _rand_vec(r)])
+        p = cp.dolly_shot(s, e, tgt, dur, easing=ease, arc=r.uniform(-8, 8), **common)
+    elif which == "crane":
+        p = cp.crane_shot(tgt, dur, radius=r.choice([0.0, 4.0, 15.0]),
+                          start_height=r.uniform(-8, 20), end_height=r.uniform(-8, 40),
+                          angle_deg=r.uniform(-360, 360), sweep_deg=r.uniform(-90, 90),
+                          easing=ease, **common)
+    elif which == "flyby":
+        p = cp.flyby_shot(tgt, dur, pass_distance=r.choice([0.0, 3.0, 20.0]),
+                          height=r.uniform(-5, 10), approach=r.choice([0.0, 30.0]),
+                          direction_deg=r.uniform(-360, 360), easing=ease, **common)
+    else:
+        p = cp.static_shot(_rand_vec(r), tgt, dur, keyframes=kf, safety=safety)
+    return p, dur, safety, which
+
+
+@pytest.mark.parametrize("seed", range(60))
+def test_property_shots_are_valid_safe_and_look_at_something(seed):
+    r = random.Random(seed)
+    for _ in range(8):
+        p, dur, safety, which = _rand_shot(r)
+        assert_valid(p)
+        ts = times(p)
+        assert ts[0] == 0 and ts[-1] == dur
+        eyes, rots = eyes_rots(p)
+        for e in eyes:
+            assert e[1] >= safety.min_y - 1e-3
+            if safety.max_y is not None:
+                assert e[1] <= safety.max_y + 1e-3
+        yaws = [x[0] for x in rots]
+        assert all(abs(b - a) <= 180.0 + 1e-3 for a, b in zip(yaws, yaws[1:]))
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_property_orbit_keeps_min_distance_and_aim(seed):
+    r = random.Random(500 + seed)
+    for _ in range(10):
+        safety = cp.Safety(min_y=-64.0, max_y=r.choice([None, 300.0]),
+                           min_distance=r.choice([1.0, 2.0, 5.0]))
+        tgt = _rand_vec(r)
+        p = cp.orbit_shot(tgt, r.choice([1, 40, 4000]), radius=r.choice([0.0, 1.0, 12.0]),
+                          height=r.uniform(-3, 3), revolutions=r.uniform(-2, 2),
+                          keyframes=r.randrange(2, 40), safety=safety)
+        assert_valid(p)
+        eyes, _ = eyes_rots(p)
+        for e in eyes:
+            assert math.dist(e, tgt) >= safety.min_distance - 1e-3
+        assert_looks_at(p, [tgt] * len(p.keyframes), tol_deg=0.05)
+
+
+@pytest.mark.parametrize("seed", range(60))
+def test_property_speed_ramp_monotone_and_pinned(seed):
+    r = random.Random(900 + seed)
+    for _ in range(10):
+        n = r.randrange(1, 5)
+        rates = [(10 ** r.uniform(-6, 6), 10 ** r.uniform(-9, 9)) for _ in range(n)]
+        start = r.choice([0, 1234, 10**9])
+        span = r.choice([1, 2, 5, 100, 10_000, 10**7])
+        dur = r.choice([1, 2, 10, 500, 5000, 120_000])
+        kf = r.choice([2, 3, 40, 200])
+        blend = r.choice([0.0, 0.08, 0.5, 3.0])
+        try:
+            path = cp.speed_ramp(start, start + span, dur, rates, keyframes=kf, blend=blend)
+        except cp.CamPathError:
+            assert span < 1 or dur < 1   # only legitimate refusals
+            continue
+        ts = [k["properties"][timeline.PROP_TIMESTAMP] for k in path.keyframes]
+        tt = times(path)
+        assert (tt[0], ts[0]) == (0, start) and (tt[-1], ts[-1]) == (dur, start + span)
+        assert all(b > a for a, b in zip(tt, tt[1:]))
+        assert all(b > a for a, b in zip(ts, ts[1:]))
+        prof = cp.speed_profile(start, start + span, dur, rates, blend=blend)
+        assert all(math.isfinite(c) and 0.0 <= c <= 1.0 for c in prof.table)
+        assert all(b >= a for a, b in zip(prof.table, prof.table[1:]))
+        prev = -1.0
+        for i in range(0, 201):
+            v = prof.replay_at(dur * i / 200)
+            assert start <= v <= start + span and v >= prev
+            prev = v
+
+
+@pytest.mark.parametrize("seed", range(30))
+def test_property_plan_highlight_any_kind_any_short_duration(seed):
+    r = random.Random(3000 + seed)
+    tr = synth_track()
+    for _ in range(6):
+        kind = r.choice(ALL_RECIPE_KINDS)
+        s = r.randrange(0, 15_000)
+        h = Highlight(kind, s, s + r.choice([1, 2, 500, 9000]), 0.5, entity=1,
+                      pos=r.choice([None, _rand_vec(r)]))
+        secs = r.choice([0.001, 0.002, 0.05, 1.0, 6.0])
+        tpath, ppath = cp.plan_highlight(h, tr, secs)
+        dur = int(round(secs * 1000))
+        assert_valid(ppath)
+        tt = times(tpath)
+        assert tt[0] == 0 and tt[-1] == dur
+        assert times(ppath)[-1] == dur
+        ts = [k["properties"][timeline.PROP_TIMESTAMP] for k in tpath.keyframes]
+        assert ts[0] == h.start_ms and ts[-1] == h.end_ms
+        assert all(b > a for a, b in zip(ts, ts[1:]))

@@ -26,7 +26,9 @@ eye, so rotation stays consistent with what the camera actually sees.
 
 from __future__ import annotations
 
+import bisect
 import math
+import numbers
 import random
 import zlib
 from dataclasses import dataclass, field
@@ -177,6 +179,14 @@ class Safety:
     min_distance: float = 2.0
     max_y: float | None = None
 
+    def __post_init__(self):
+        if not (math.isfinite(self.min_y) and math.isfinite(self.min_distance)
+                and self.min_distance >= 0):
+            raise CamPathError("Safety needs finite min_y and min_distance >= 0")
+        if self.max_y is not None and not (math.isfinite(self.max_y)
+                                           and self.max_y >= self.min_y):
+            raise CamPathError("Safety.max_y must be finite and >= min_y")
+
 
 def clamp_pitch(pitch: float) -> float:
     """Pitch limited to what a Minecraft camera can show."""
@@ -203,38 +213,51 @@ def _finite(x, what: str) -> float:
     return f
 
 
+def _is_int(v) -> bool:
+    return isinstance(v, numbers.Integral) and not isinstance(v, bool)
+
+
 def _check_common(duration_ms, keyframes) -> int:
     d = _finite(duration_ms, "duration_ms")
     if d < 1:
         raise CamPathError("duration_ms must be >= 1")
-    if keyframes < 2:
-        raise CamPathError("a shot needs at least 2 keyframes")
+    if not _is_int(keyframes) or keyframes < 2:
+        raise CamPathError("a shot needs at least 2 integer keyframes")
     return int(round(d))
 
 
 def _safe_eye(eye, target, safety: Safety):
+    """Clamp the eye into [min_y, max_y], then push it out to min_distance.
+
+    The push is radial (keeps the framing). If that would leave the allowed
+    height band, the eye is pinned to the band edge and slid horizontally
+    instead, which always reaches min_distance (a purely horizontal move of
+    ``sqrt(d^2 - dy^2)`` suffices, and is 0 when |dy| alone is enough).
+    """
     x, y, z = eye
-    for _ in range(3):
-        y = max(safety.min_y, y)
-        if safety.max_y is not None:
-            y = min(safety.max_y, y)
-        dx, dy, dz = x - target[0], y - target[1], z - target[2]
-        d = math.sqrt(dx * dx + dy * dy + dz * dz)
-        if d >= safety.min_distance - 1e-9:
-            break
-        if d < 1e-9:
-            dx, dy, dz, d = 1.0, 0.0, 0.0, 1.0  # arbitrary but deterministic
-        s = safety.min_distance / d
-        x, y, z = target[0] + dx * s, target[1] + dy * s, target[2] + dz * s
-        if y < safety.min_y:
-            # Floor blocks the push: slide out horizontally instead.
-            y = safety.min_y
-            dy = y - target[1]
-            h = math.sqrt(max(0.0, safety.min_distance ** 2 - dy * dy))
-            hd = math.hypot(dx, dz) or 1.0
-            x = target[0] + dx / hd * h
-            z = target[2] + dz / hd * h
-    return (x, y, z)
+    md = safety.min_distance
+
+    def clamp_y(v):
+        v = max(safety.min_y, v)
+        return v if safety.max_y is None else min(safety.max_y, v)
+
+    y = clamp_y(y)
+    dx, dy, dz = x - target[0], y - target[1], z - target[2]
+    d = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if d >= md - 1e-9:
+        return (x, y, z)
+    if d < 1e-9:
+        dx, dy, dz, d = 1.0, 0.0, 0.0, 1.0  # arbitrary but deterministic
+    s = md / d
+    ny = target[1] + dy * s
+    if clamp_y(ny) == ny:
+        return (target[0] + dx * s, ny, target[2] + dz * s)
+    y = clamp_y(ny)
+    dy = y - target[1]
+    h = math.sqrt(max(0.0, md * md - dy * dy))
+    hd = math.hypot(dx, dz)
+    ux, uz = (dx / hd, dz / hd) if hd > 1e-9 else (1.0, 0.0)
+    return (target[0] + ux * h, y, target[2] + uz * h)
 
 
 def _finalise(eyes, times, targets, interpolator, safety: Safety | None) -> Path:
@@ -266,10 +289,45 @@ def _finalise(eyes, times, targets, interpolator, safety: Safety | None) -> Path
     ]
     interp = timeline.catmull_rom() if interpolator is None else interpolator
     path = timeline._camera_path(k_eyes, k_times, k_targets, interp)
+    _fix_degenerate_yaw(path, k_eyes, k_targets)
     for kf in path.keyframes:
-        rot = kf["properties"][PROP_ROTATION]
+        props = kf["properties"]
+        rot = props[PROP_ROTATION]
         rot[1] = clamp_pitch(rot[1])
+        props[PROP_ROTATION] = [v + 0.0 for v in rot]       # -0.0 -> 0.0
+        props[PROP_POSITION] = [v + 0.0 for v in props[PROP_POSITION]]
     return path
+
+
+def _fix_degenerate_yaw(path: Path, eyes, targets) -> None:
+    """Hold yaw steady where the eye is (almost) straight above/below the target.
+
+    There ``atan2`` has no meaningful answer (it returns 0/-0/180 arbitrarily),
+    so neighbouring keyframes would spin the camera a half turn for nothing.
+    Degenerate keyframes borrow the nearest well-defined yaw, then the whole
+    sequence is re-unwrapped.
+    """
+    deg = [math.hypot(e[0] - t[0], e[2] - t[2]) < 1e-6 for e, t in zip(eyes, targets)]
+    if not any(deg) or all(deg):
+        return
+    yaws = [kf["properties"][PROP_ROTATION][0] for kf in path.keyframes]
+    n = len(yaws)
+    filled = list(yaws)
+    last = None
+    for i in range(n):            # forward fill
+        if deg[i]:
+            filled[i] = last
+        else:
+            last = yaws[i]
+    nxt = None
+    for i in reversed(range(n)):  # leading degenerates take the next good yaw
+        if not deg[i]:
+            nxt = yaws[i]
+        elif filled[i] is None:
+            filled[i] = nxt
+    wrapped = [((y + 180.0) % 360.0) - 180.0 for y in filled]
+    for kf, y in zip(path.keyframes, timeline._unwrap(wrapped)):
+        kf["properties"][PROP_ROTATION][0] = round(y, 3)
 
 
 def _sample_fracs(n: int) -> list[float]:
@@ -458,6 +516,31 @@ def static_shot(
 hold = static_shot  # the name editors use for "leave the camera where it is"
 
 
+def _window_track(track: tracks.Track, lo: float, hi: float) -> tracks.Track:
+    """Finite, time-sorted copy of ``track`` trimmed to what shapes [lo, hi].
+
+    Keeps ``max(SMOOTH_CANDIDATES)`` ms either side (the widest moving-average
+    half-window is half of that) plus one extra sample each side so
+    interpolation at the edges is unchanged.
+    """
+    pts = []
+    for p in track.points:
+        try:
+            v = tuple(float(c) for c in p)
+        except (TypeError, ValueError):
+            continue
+        if len(v) >= 4 and all(math.isfinite(c) for c in v):
+            pts.append(v)
+    if not pts:
+        raise CamPathError("follow_shot track has no finite points")
+    pts.sort(key=lambda p: p[0])
+    margin = max(tracks.SMOOTH_CANDIDATES) + 1000
+    ts = [p[0] for p in pts]
+    a = max(0, bisect.bisect_left(ts, lo - margin) - 1)
+    b = min(len(pts), bisect.bisect_right(ts, hi + margin) + 1)
+    return tracks.Track(track.entity_id, pts[a:b])
+
+
 def follow_shot(
     track: tracks.Track,
     replay_start_ms: float,
@@ -486,8 +569,14 @@ def follow_shot(
     dur = _check_common(duration_ms, keyframes)
     if not getattr(track, "points", None):
         raise CamPathError("follow_shot needs a non-empty track")
+    replay_start_ms = _finite(replay_start_ms, "replay_start_ms")
+    replay_end_ms = _finite(replay_end_ms, "replay_end_ms")
     if replay_end_ms <= replay_start_ms:
         raise CamPathError("replay_end_ms must be after replay_start_ms")
+    # Smoothing and Track.at are linear in the track length per call, so a
+    # whole-replay track would make this quadratic. Only the shot's neighbourhood
+    # (plus the widest smoothing half-window) can influence it.
+    track = _window_track(track, replay_start_ms, replay_end_ms)
     window, _dev = tracks.choose_smoothing(
         track, replay_start_ms, replay_end_ms, keyframes, max_deviation_blocks)
     sm = track.smoothed(window_ms=window) if window else track
@@ -518,6 +607,8 @@ class SpeedProfile:
 
     def replay_at(self, video_ms: float) -> float:
         """Replay timestamp shown at ``video_ms`` (clamped to the clip)."""
+        if video_ms != video_ms:
+            raise CamPathError("video_ms must not be NaN")
         f = _clamp01(video_ms / self.duration_ms) * (len(self.table) - 1)
         i = min(int(f), len(self.table) - 2)
         frac = f - i
@@ -561,7 +652,14 @@ def speed_profile(
             raise CamPathError(f"bad rate piece {(share, speed)!r}: need share>0, speed>0")
         shares.append(float(share))
         speeds.append(float(speed))
+    # Only ratios matter: normalise so extreme magnitudes cannot overflow the
+    # cumulative sums (1e308 speeds) or lose everything to underflow.
+    top_speed = max(speeds)
+    speeds = [sp / top_speed for sp in speeds]
+    top_share = max(shares)
+    shares = [sh / top_share for sh in shares]
     total = sum(shares)
+    blend = _finite(blend, "blend")
     n = max(20, int(resolution))
     rate = []
     for i in range(n):
@@ -585,7 +683,7 @@ def speed_profile(
     for r in rate:
         cum.append(cum[-1] + r)
     top = cum[-1]
-    table = tuple(c / top for c in cum)
+    table = tuple(min(1.0, c / top) for c in cum)
     return SpeedProfile(float(duration_ms), float(replay_start_ms),
                         float(replay_end_ms), table)
 
@@ -607,8 +705,8 @@ def speed_ramp(
     (duration -> replay_end); timestamps and times are strictly increasing
     (colliding samples are dropped, never the endpoints).
     """
-    if keyframes < 2:
-        raise CamPathError("speed_ramp needs at least 2 keyframes")
+    if not _is_int(keyframes) or keyframes < 2:
+        raise CamPathError("speed_ramp needs at least 2 integer keyframes")
     dur = int(round(_finite(duration_ms, "duration_ms")))
     prof = speed_profile(replay_start_ms, replay_end_ms, dur, rates, blend=blend)
     pts: list[tuple[int, int]] = []
