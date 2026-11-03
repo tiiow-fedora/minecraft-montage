@@ -348,3 +348,29 @@ mcmontage/music.py     licence records and automatic attribution
 mcmontage/youtube.py   OAuth + resumable upload (private)
 mcmontage/cli.py       command line
 ```
+
+## Tests
+
+```bash
+python -m pip install pytest
+python -m pytest
+```
+
+No Minecraft, Java or network needed. `tests/synthetic.py` builds fake `.mcpr`
+files (a zip with `metaData.json`, filler `recording.tmcpr`, optional
+`renderQueue.json` / `timelines.json`), fake entity-track JSON, and — if
+`ffmpeg` is on `PATH` — tiny test clips and tones. Tests that need ffmpeg are
+marked `ffmpeg` and skip when it is missing.
+
+Generated output is checked against golden files in `tests/golden/`: the
+`renderQueue.json` for static and follow plans, the nested timeline JSON, the
+full ffmpeg argument list for several clip/music/title combinations, and CLI
+output. If generated output changes on purpose, review and refresh them with:
+
+```bash
+UPDATE_GOLDEN=1 python -m pytest && git diff tests/golden
+```
+
+The goldens pin *this code's* output; they are not proof the mod accepts it.
+The schema was validated against the real mod on 2026-09-08 (see above), and a
+golden changing is a prompt to re-check that, not to just regenerate.
