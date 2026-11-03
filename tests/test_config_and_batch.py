@@ -2,7 +2,7 @@ import pytest
 
 import synthetic as syn
 from datetime import datetime
-from golden import assert_golden
+from golden import assert_golden, norm_tmp
 from mcmontage import config, pipeline, replay
 
 
@@ -116,5 +116,5 @@ def test_batch_prepare_log_output_golden(tmp_path, cfg):
     pipeline.batch_prepare(cfg, paths, seconds=10, max_speedup=5,
                            rename_scheme="day{session}_{n}", follow=False,
                            centre=(1, 2, 3), keyframes=4, log=lines.append)
-    text = "\n".join(lines).replace(str(tmp_path), "<TMP>")
+    text = norm_tmp("\n".join(lines), tmp_path)
     assert_golden("batch_log.txt", text)

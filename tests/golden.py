@@ -39,3 +39,25 @@ def assert_golden(name: str, obj) -> None:
             want.splitlines(True), text.splitlines(True),
             f"golden/{name}", "actual", n=2))
         raise AssertionError(f"output differs from golden/{name}:\n{diff[:4000]}")
+
+
+def norm_tmp(value, tmp):
+    """Replace a temp dir with <TMP> in a str (or list of str), platform-neutrally.
+
+    On Windows the temp dir has backslashes and a drive colon, which ffmpeg
+    filter escaping turns into ``C\\:/Users/...``; fold all spellings so the
+    same golden matches on every OS.
+    """
+    import re
+    from pathlib import PurePath
+
+    if isinstance(value, (list, tuple)):
+        return [norm_tmp(v, tmp) for v in value]
+    tmp = str(tmp)
+    spellings = {tmp, tmp.replace("\\", "/"),
+                 tmp.replace("\\", "/").replace(":", "\\:")}
+    for sp in sorted(spellings, key=len, reverse=True):
+        value = value.replace(sp, "<TMP>")
+    # path remainder after <TMP>: separators are not significant
+    return re.sub(r"<TMP>[^\s\"',;\[\]]*",
+                  lambda m: m.group(0).replace("\\", "/"), value)

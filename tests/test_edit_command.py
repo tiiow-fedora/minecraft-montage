@@ -6,7 +6,7 @@ version installed; the clips just need to exist.
 
 import pytest
 
-from golden import assert_golden
+from golden import assert_golden, norm_tmp
 from mcmontage import edit
 
 
@@ -36,7 +36,7 @@ def mk(tmp_path, *names):
 
 
 def norm(args, tmp_path):
-    return [a.replace(str(tmp_path), "<TMP>") for a in args]
+    return norm_tmp(args, tmp_path)
 
 
 def build(tmp_path, clips, **kw):

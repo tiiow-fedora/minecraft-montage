@@ -4,7 +4,7 @@ from datetime import datetime
 import pytest
 
 import synthetic as syn
-from golden import assert_golden
+from golden import assert_golden, norm_tmp
 from mcmontage import cli, music, pipeline, youtube
 
 
@@ -25,7 +25,7 @@ def run(conf, *argv):
 
 
 def norm(text, tmp):
-    return text.replace(str(tmp), "<TMP>")
+    return norm_tmp(text, tmp)
 
 
 def test_cli_plan_static_then_inspect_golden(env, capsys):
