@@ -136,3 +136,22 @@ def test_find_replays_newest_first_and_ignores_others(tmp_path):
 
 def test_schema_validated_flags_are_set():
     assert replay.SCHEMA_VALIDATED is True
+
+
+def test_corrupt_replays_raise_replay_error_not_zipfile_error(tmp_path):
+    """Callers (batch_prepare, the GUI) only catch ReplayError."""
+    junk = tmp_path / "junk.mcpr"
+    junk.write_bytes(b"this is not a zip")
+    with pytest.raises(replay.ReplayError):
+        replay.inspect(junk)
+    with pytest.raises(replay.ReplayError):
+        replay.read_render_queue(junk)
+
+    badjson = syn.make_mcpr(tmp_path / "bad.mcpr", omit_metadata=True,
+                            extra_entries={"metaData.json": "{not json"})
+    with pytest.raises(replay.ReplayError):
+        replay.inspect(badjson)
+
+    badq = syn.make_mcpr(tmp_path / "q.mcpr", render_queue="[{oops")
+    with pytest.raises(replay.ReplayError):
+        replay.read_render_queue(badq)

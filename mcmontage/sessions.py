@@ -149,18 +149,39 @@ def apply_renames(plan):
     Renumbering a set of files inevitably means some new name is another file's
     current name, so a straight rename can clobber. Parking everything under
     temporary names first makes the order irrelevant.
+
+    Everything is validated before the first rename, and a failure part-way
+    puts parked files back, so an error never strands recordings under
+    __mcmontage_rename_N.tmp names.
     """
     if not plan:
         return []
-    temps = []
-    for i, (src, dst) in enumerate(plan):
+    sources = {src for src, _ in plan}
+    targets = [dst for _, dst in plan]
+    if len(set(targets)) != len(targets):
+        raise SessionError("two files would be renamed to the same name")
+    for src, dst in plan:
         if not src.is_file():
             raise SessionError(f"gone before rename: {src}")
-        tmp = src.with_name(f"__mcmontage_rename_{i}.tmp")
-        src.rename(tmp)
-        temps.append((tmp, dst, src))
-    done = []
-    for tmp, dst, src in temps:
-        tmp.rename(dst)
-        done.append((src, dst))
-    return done
+        if dst.exists() and dst not in sources:
+            raise SessionError(
+                f"will not overwrite {dst.name}: it exists and is not part of "
+                "this rename")
+
+    parked = []          # (tmp, src, dst)
+    placed = []          # (dst, tmp)
+    try:
+        for i, (src, dst) in enumerate(plan):
+            tmp = src.with_name(f"__mcmontage_rename_{i}.tmp")
+            src.rename(tmp)
+            parked.append((tmp, src, dst))
+        for tmp, src, dst in parked:
+            tmp.rename(dst)
+            placed.append((dst, tmp))
+    except OSError:
+        for dst, tmp in reversed(placed):
+            dst.rename(tmp)
+        for tmp, src, _ in parked:
+            tmp.rename(src)
+        raise
+    return [(src, dst) for _, src, dst in parked]

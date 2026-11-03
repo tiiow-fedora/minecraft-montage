@@ -90,18 +90,21 @@ def inspect(mcpr: Path) -> ReplayInfo:
     mcpr = Path(mcpr)
     if not mcpr.is_file():
         raise ReplayError(f"no such replay: {mcpr}")
-    with zipfile.ZipFile(mcpr) as zf:
-        names = zf.namelist()
-        meta = _read_json_entry(zf, METADATA_ENTRY) or {}
-        if not isinstance(meta, dict):
-            meta = {}
-        return ReplayInfo(
-            path=mcpr,
-            entries=names,
-            metadata=meta,
-            has_render_queue=RENDER_QUEUE_ENTRY in names,
-            has_timelines=TIMELINES_ENTRY in names,
-        )
+    try:
+        with zipfile.ZipFile(mcpr) as zf:
+            names = zf.namelist()
+            meta = _read_json_entry(zf, METADATA_ENTRY) or {}
+            if not isinstance(meta, dict):
+                meta = {}
+            return ReplayInfo(
+                path=mcpr,
+                entries=names,
+                metadata=meta,
+                has_render_queue=RENDER_QUEUE_ENTRY in names,
+                has_timelines=TIMELINES_ENTRY in names,
+            )
+    except (zipfile.BadZipFile, ValueError) as exc:
+        raise ReplayError(f"{mcpr.name}: not a readable replay ({exc})") from exc
 
 
 def read_render_queue(mcpr: Path) -> list[dict]:
@@ -111,8 +114,12 @@ def read_render_queue(mcpr: Path) -> list[dict]:
     "_timeline_raw": <original string>} so a round-trip can be compared
     byte-for-byte against what the mod wrote.
     """
-    with zipfile.ZipFile(mcpr) as zf:
-        queue = _read_json_entry(zf, RENDER_QUEUE_ENTRY)
+    try:
+        with zipfile.ZipFile(mcpr) as zf:
+            queue = _read_json_entry(zf, RENDER_QUEUE_ENTRY)
+    except (zipfile.BadZipFile, ValueError) as exc:
+        raise ReplayError(
+            f"{Path(mcpr).name}: cannot read {RENDER_QUEUE_ENTRY} ({exc})") from exc
     if queue is None:
         return []
     if not isinstance(queue, list):

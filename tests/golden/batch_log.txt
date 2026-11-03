@@ -1,0 +1,15 @@
+Renaming 2 files:
+  raw0.mcpr        -> day1_1.mcpr
+  raw1.mcpr        -> day1_2.mcpr
+
+[1/2] day1_1.mcpr
+  Capping at x5: using 0.8 min from the middle of 5.0.
+  Static orbit around (1.0, 2.0, 3.0).
+  Wrote camera path into day1_1.mcpr (1 job).
+
+[2/2] day1_2.mcpr
+  Capping at x5: using 0.8 min from the middle of 5.0.
+  Static orbit around (1.0, 2.0, 3.0).
+  Wrote camera path into day1_2.mcpr (1 job).
+
+Prepared 2 of 2.
