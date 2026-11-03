@@ -4,6 +4,10 @@
     python -m mcmontage inspect [REPLAY]    dump a .mcpr, validate the schema
     python -m mcmontage plan REPLAY ...     write a camera path into the replay
     python -m mcmontage edit CLIP...        stitch clips, add music and titles
+    python -m mcmontage highlights [REPLAY] detect highlights
+    python -m mcmontage autoplan [REPLAY]   camera shots for the best highlights
+    python -m mcmontage assemble CLIP...    transitions + beat-synced cuts
+    python -m mcmontage queue ACTION        batch queue status/retry/prune/reset
     python -m mcmontage upload VIDEO ...    upload (lands private)
 """
 
@@ -161,6 +165,99 @@ def cmd_tracks(args):
         print("%-8d %8d %9d %9d %10.1f%s" % (eid, n, t0, t1, dist, mark))
     print()
     print("Pass --follow to orbit the marked entity, or --follow-entity ID to override.")
+
+
+def _fmt_ms(ms):
+    s = int(ms // 1000)
+    return "%d:%02d" % (s // 60, s % 60)
+
+
+def cmd_highlights(args):
+    from . import auto as auto_mod
+    from . import highlights as hl_mod
+    from . import tracks as tracks_mod
+
+    cfg = config_mod.load(args.config)
+    path = _pick_replay(cfg, args.replay)
+    try:
+        found, _tracks, player = auto_mod.find_highlights(
+            cfg, path, retrack=args.retrack)
+    except (auto_mod.AutoError, tracks_mod.TrackError) as e:
+        raise SystemExit(str(e))
+    print("replay: %s   player entity: %d   %d highlight(s)"
+          % (path.name, player, len(found)))
+    for i, h in enumerate(found, 1):
+        print("%3d  %-6s %s-%s  score %.2f  %s"
+              % (i, h.kind, _fmt_ms(h.start_ms), _fmt_ms(h.end_ms),
+                 h.score, h.label))
+    if args.out:
+        hl_mod.save_highlights(args.out, found)
+        print("saved", args.out)
+
+
+def cmd_autoplan(args):
+    from . import auto as auto_mod
+    from . import campath as campath_mod
+
+    cfg = config_mod.load(args.config)
+    path = _pick_replay(cfg, args.replay)
+    try:
+        found, tracks, _player = auto_mod.find_highlights(cfg, path)
+        chosen = auto_mod.choose(found, args.total, args.seconds_each,
+                                 max_count=args.max_count)
+        if not chosen:
+            raise SystemExit("no highlights found in %s" % path.name)
+        jobs = auto_mod.plan_highlight_jobs(
+            cfg, path, chosen, tracks, args.seconds_each)
+    except (auto_mod.AutoError, campath_mod.CamPathError) as e:
+        raise SystemExit(str(e))
+    for h, j in zip(chosen, jobs):
+        print("  %-6s %s-%s  -> %s" % (h.kind, _fmt_ms(h.start_ms),
+              _fmt_ms(h.end_ms), j["settings"]["outputFile"]))
+    if args.dry_run:
+        print("--- dry run, nothing written ---")
+        return
+    if pipeline_mod.minecraft_running():
+        raise SystemExit("Minecraft is running; quit it first.")
+    n = auto_mod.write_jobs(path, jobs, append=args.append)
+    print("Wrote %d job(s). Open the replay in game and use Render Queue." % n)
+
+
+def cmd_assemble(args):
+    from . import auto as auto_mod
+
+    cfg = config_mod.load(args.config)
+    music = None
+    if args.music:
+        try:
+            music = music_mod.get(args.music).file
+        except music_mod.MusicError as e:
+            raise SystemExit(str(e))
+    out = args.out or (cfg.output / "montage.mp4")
+    try:
+        argv = auto_mod.assemble(
+            cfg, args.clips, music, out, style=args.style, seed=args.seed,
+            sync=not args.no_sync, dry_run=args.dry_run)
+    except (auto_mod.AutoError, edit_mod.EditError) as e:
+        raise SystemExit(str(e))
+    if args.dry_run:
+        print(edit_mod.describe_command(argv))
+
+
+def cmd_queue(args):
+    from . import jobqueue as jq
+
+    cfg = config_mod.load(args.config)
+    q = jq.JobQueue(jq.default_queue_path(cfg))
+    if args.action == "status":
+        print(q.format_status())
+    elif args.action == "retry":
+        print("revived %d job(s)" % len(q.retry_failed()))
+    elif args.action == "prune":
+        print("pruned %d job(s)" % q.prune_done())
+    elif args.action == "reset":
+        q.reset()
+        print("queue cleared")
 
 
 def _sessions(cfg, args):
@@ -353,6 +450,37 @@ def main(argv=None):
     p.add_argument("--retrack", action="store_true")
     p.add_argument("--limit", type=int, default=12)
     p.set_defaults(func=cmd_tracks)
+
+    p = sub.add_parser("highlights", help="detect deaths, kills, speed, builds")
+    p.add_argument("replay", nargs="?")
+    p.add_argument("--retrack", action="store_true")
+    p.add_argument("--out", help="save the highlights as JSON")
+    p.set_defaults(func=cmd_highlights)
+
+    p = sub.add_parser("autoplan",
+                       help="detect highlights and write one camera shot each")
+    p.add_argument("replay", nargs="?")
+    p.add_argument("--total", type=float, default=60.0, help="montage seconds")
+    p.add_argument("--seconds-each", type=float, default=8.0)
+    p.add_argument("--max-count", type=int)
+    p.add_argument("--append", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_autoplan)
+
+    p = sub.add_parser("assemble",
+                       help="join clips with varied transitions, cut to the beat")
+    p.add_argument("clips", nargs="+")
+    p.add_argument("--music", help="track id from music/tracks.toml")
+    p.add_argument("--style", default="dynamic", choices=("subtle", "dynamic", "fade"))
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--no-sync", action="store_true", help="skip beat sync")
+    p.add_argument("--out")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_assemble)
+
+    p = sub.add_parser("queue", help="inspect or maintain the batch job queue")
+    p.add_argument("action", choices=("status", "retry", "prune", "reset"))
+    p.set_defaults(func=cmd_queue)
 
     p = sub.add_parser("edit",
                        help="assemble the finished video (several clips are "
