@@ -504,19 +504,32 @@ def test_check_stop_inside_handler_refunds_attempt(q):
 
 
 def test_handler_except_exception_cannot_swallow_stop(q):
+    """A handler's broad ``except Exception`` must not intercept a stop."""
+    trace = []
+    stop = {"now": False}
+
     def handler(ctx):
+        stop["now"] = True            # the stop request arrives mid-handler
         try:
             ctx.check_stop()
-        except Exception:
+            trace.append("not-raised")
+        except Exception:             # the trap: must NOT catch StopRequested
+            trace.append("swallowed")
             return "swallowed"
+        trace.append("unreachable")   # check_stop raised BaseException past us
 
     j = q.add("a")
-    q.run(reg(a=handler), should_stop=lambda: True if False else _always_after_start(q, j))
-    assert q.get(j.id).status in ("pending", "done")
-
-
-def _always_after_start(q, j):
-    return q.get(j.id).status == "running"
+    k = q.add("a")
+    rep = q.run(reg(a=handler), should_stop=lambda: stop["now"])
+    assert trace == []                # neither "swallowed" nor "not-raised"
+    assert issubclass(jq.StopRequested, BaseException)
+    assert not issubclass(jq.StopRequested, Exception)
+    assert rep.stopped and not rep.done and not rep.failed
+    got = q.get(j.id)
+    assert got.status == "pending" and got.attempts == 0 and got.result is None
+    assert got.error is None
+    assert q.get(k.id).status == "pending"    # run halted; nothing else started
+    assert not q._runner_lock.path.exists()
 
 
 def test_keyboard_interrupt_requeues_and_propagates(q):
@@ -1361,3 +1374,579 @@ def test_default_queue_path():
         work = "w"
 
     assert str(jq.default_queue_path(C())) == os.path.join("w", "queue.json")
+
+
+# ================================================================ adversarial review additions
+
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+
+
+def _run_py(code, *args, **kw):
+    env = dict(os.environ, PYTHONPATH=REPO_ROOT)
+    return subprocess.Popen([sys.executable, "-c", textwrap.dedent(code), *map(str, args)],
+                            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, **kw)
+
+
+def _finish_procs(procs, timeout=120):
+    outs = []
+    for p in procs:
+        out, err = p.communicate(timeout=timeout)
+        assert p.returncode == 0, err
+        outs.append(out)
+    return outs
+
+
+RUNNER_SCRIPT = """
+    import os, sys, time
+    from mcmontage.jobqueue import JobQueue, Registry
+    qpath, log = sys.argv[1], sys.argv[2]
+    def handler(ctx):
+        # O_APPEND single-write lines are atomic across processes
+        fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+        os.write(fd, ("start %s %d\\n" % (ctx.job.id, os.getpid())).encode()); os.close(fd)
+        time.sleep(0.003)
+        return {"pid": os.getpid()}
+    r = Registry().register("a", handler)
+    q = JobQueue(qpath)
+    rep = q.run(r, lock_timeout=60)
+    print(len(rep.done))
+"""
+
+
+def test_two_runner_processes_racing_run_every_job_exactly_once(tmp_path):
+    qpath = tmp_path / "queue.json"
+    log = tmp_path / "log.txt"
+    q = JobQueue(qpath)
+    for i in range(40):
+        q.add("a", {"i": i})
+    procs = [_run_py(RUNNER_SCRIPT, qpath, log) for _ in range(3)]
+    _finish_procs(procs)
+    started = [l.split()[1] for l in log.read_text().splitlines()]
+    assert sorted(started) == sorted(j.id for j in JobQueue(qpath).jobs())
+    assert len(started) == len(set(started)) == 40
+    s = JobQueue(qpath).summary()
+    assert s["done"] == 40 and s["total"] == 40
+    for name in os.listdir(tmp_path):
+        assert not name.endswith((".lock", ".tmp")) and ".stale-" not in name, name
+
+
+def test_runners_racing_while_another_process_adds_jobs(tmp_path):
+    qpath = tmp_path / "queue.json"
+    log = tmp_path / "log.txt"
+    JobQueue(qpath).add("a", {"i": -1})
+    adder = """
+        import sys
+        from mcmontage.jobqueue import JobQueue
+        q = JobQueue(sys.argv[1])
+        for i in range(30):
+            q.add("a", {"i": i}, key="k%d" % i)
+    """
+    procs = [_run_py(RUNNER_SCRIPT, qpath, log), _run_py(adder, qpath),
+             _run_py(RUNNER_SCRIPT, qpath, log), _run_py(adder, qpath)]
+    _finish_procs(procs)
+    # whatever the runners missed (added after they finished) is picked up now
+    calls = []
+    JobQueue(qpath).run(reg(a=recorder(calls)))
+    started = [l.split()[1] for l in log.read_text().splitlines()] + calls
+    q = JobQueue(qpath)
+    ids = sorted(j.id for j in q.jobs())
+    assert len(ids) == 31                      # keys dedupe the two adders
+    assert sorted(started) == ids              # every job ran, none twice
+    assert q.summary()["done"] == 31
+
+
+def test_sigkilled_runner_is_recovered_and_job_reruns_once(tmp_path):
+    qpath = tmp_path / "queue.json"
+    log = tmp_path / "log.txt"
+    q = JobQueue(qpath)
+    for i in range(5):
+        q.add("a", {"i": i})
+    hang = """
+        import os, sys, time
+        from mcmontage.jobqueue import JobQueue, Registry
+        qpath, log = sys.argv[1], sys.argv[2]
+        def handler(ctx):
+            fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+            os.write(fd, ("start %s %d\\n" % (ctx.job.id, os.getpid())).encode()); os.close(fd)
+            if ctx.job.id == "j0003":
+                time.sleep(600)
+        JobQueue(qpath).run(Registry().register("a", handler))
+    """
+    victim = _run_py(hang, qpath, log)
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if log.exists() and "j0003" in log.read_text():
+            break
+        time.sleep(0.02)
+    else:
+        victim.kill()
+        pytest.fail("victim never reached j0003")
+    victim.kill()
+    victim.communicate()                       # reap: a zombie pid would look alive
+    assert JobQueue(qpath, recover=False).get("j0003").status == "running"
+
+    _finish_procs([_run_py(RUNNER_SCRIPT, qpath, log)])
+    names = [l.split()[1] for l in log.read_text().splitlines()]
+    assert names.count("j0003") == 2           # the interrupted one, re-run once
+    assert all(names.count(f"j000{i}") == 1 for i in (1, 2, 4, 5))
+    q = JobQueue(qpath)
+    assert q.summary()["done"] == 5
+    assert q.get("j0003").attempts == 2
+
+
+def test_filelock_mutual_exclusion_across_processes_including_stale_start(tmp_path):
+    """4 processes do non-atomic read-modify-write under one lock that starts
+    out stale. Any double-grant loses an increment."""
+    lockp = tmp_path / "x.lock"
+    counter = tmp_path / "counter"
+    counter.write_text("0")
+    write_lock(lockp, dead_pid())
+    code = """
+        import sys
+        from pathlib import Path
+        from mcmontage.jobqueue import FileLock
+        lockp, counter = Path(sys.argv[1]), Path(sys.argv[2])
+        for _ in range(40):
+            with FileLock(lockp, stale_after=60, timeout=60, poll=0.001):
+                n = int(counter.read_text())
+                counter.write_text(str(n + 1))
+    """
+    _finish_procs([_run_py(code, lockp, counter) for _ in range(4)])
+    assert counter.read_text() == "160"
+
+
+def test_stale_takeover_toctou_does_not_steal_a_freshly_taken_lock(tmp_path, monkeypatch):
+    """B decided the lock was stale; before B removes it, A finishes its own
+    takeover. B must notice it grabbed A's live lock and back off."""
+    lockp = tmp_path / "x.lock"
+    write_lock(lockp, dead_pid())
+    a = FileLock(lockp, stale_after=100)
+    b = FileLock(lockp, stale_after=100, timeout=0.2, poll=0.01)
+    real_unlink, real_rename = os.unlink, os.rename
+    fired = []
+
+    def interfere():
+        if not fired:
+            fired.append(1)
+            real_unlink(lockp)
+            a.acquire()
+
+    def unlink(path, *x, **k):
+        if Path(path) == lockp:
+            interfere()
+        return real_unlink(path, *x, **k)
+
+    def rename(src, dst, *x, **k):
+        if Path(src) == lockp:
+            interfere()
+        return real_rename(src, dst, *x, **k)
+
+    monkeypatch.setattr(os, "unlink", unlink)
+    monkeypatch.setattr(os, "rename", rename)
+    with pytest.raises(LockHeldError):
+        b.acquire()
+    assert fired and a.held and not b.held
+    assert json.loads(lockp.read_text())["token"] == a.token
+    monkeypatch.undo()
+    a.release()
+    assert not lockp.exists()
+    assert [n for n in os.listdir(tmp_path)] == []
+
+
+def test_stale_takeover_leaves_no_debris(tmp_path):
+    lockp = tmp_path / "x.lock"
+    write_lock(lockp, dead_pid())
+    with FileLock(lockp, stale_after=100):
+        pass
+    assert os.listdir(tmp_path) == []
+
+
+def test_pid_alive_rejects_absurd_pids():
+    assert not jq._pid_alive(2 ** 70)
+    assert not jq._pid_alive(-5)
+    lock = Path("/nonexistent")
+    assert lock  # keep linter quiet
+
+
+@pytest.mark.skipif(not os.path.exists("/proc/self/stat"), reason="needs /proc")
+def test_pid_alive_zombie_counts_as_dead():
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    deadline = time.time() + 10
+    while time.time() < deadline:        # wait for exit without reaping
+        try:
+            state = Path(f"/proc/{p.pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        except OSError:
+            break
+        if state == "Z":
+            break
+        time.sleep(0.01)
+    try:
+        assert not jq._pid_alive(p.pid)
+    finally:
+        p.wait()
+
+
+class _FakeKernel32:
+    def __init__(self, handle, exit_code=259):
+        self.handle, self.exit_code, self.closed = handle, exit_code, []
+        self.opened = []
+
+    def OpenProcess(self, access, inherit, pid):
+        self.opened.append((access, inherit, pid))
+        return self.handle
+
+    def GetExitCodeProcess(self, handle, ref):
+        ref._obj.value = self.exit_code
+        return 1
+
+    def CloseHandle(self, handle):
+        self.closed.append(handle)
+        return 1
+
+
+def test_windows_pid_check_logic_with_fake_kernel32():
+    k = _FakeKernel32(handle=0x1234, exit_code=259)
+    assert jq._pid_alive_windows(77, k, lambda: 0)
+    assert k.opened == [(0x1000, False, 77)] and k.closed == [0x1234]
+    k = _FakeKernel32(handle=0x1234, exit_code=0)
+    assert not jq._pid_alive_windows(77, k, lambda: 0)
+    assert k.closed == [0x1234]
+    # no handle: access denied means it exists, invalid parameter means gone
+    assert jq._pid_alive_windows(77, _FakeKernel32(handle=0), lambda: 5)
+    assert not jq._pid_alive_windows(77, _FakeKernel32(handle=0), lambda: 87)
+
+
+def test_windows_release_retries_when_unlink_hits_sharing_violation(tmp_path, monkeypatch):
+    monkeypatch.setattr(jq, "_IS_WINDOWS", True)
+    monkeypatch.setattr(jq, "_FS_RETRY_DELAY", 0.001)
+    lock = FileLock(tmp_path / "x.lock", stale_after=100)
+    lock.acquire()
+    real, calls = os.unlink, []
+
+    def flaky(path, *a, **k):
+        calls.append(path)
+        if len(calls) < 3:
+            raise PermissionError(13, "sharing violation")
+        return real(path, *a, **k)
+
+    monkeypatch.setattr(os, "unlink", flaky)
+    lock.release()
+    monkeypatch.undo()
+    assert not (tmp_path / "x.lock").exists()
+
+
+def test_windows_replace_retries_on_permission_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(jq, "_IS_WINDOWS", True)
+    monkeypatch.setattr(jq, "_FS_RETRY_DELAY", 0.001)
+    real, n = os.replace, []
+
+    def flaky(a, b, *x, **k):
+        n.append(1)
+        if len(n) < 3:
+            raise PermissionError(13, "file in use by a reader")
+        return real(a, b, *x, **k)
+
+    monkeypatch.setattr(os, "replace", flaky)
+    jq._atomic_write_text(tmp_path / "f.json", "{}")
+    monkeypatch.undo()
+    assert (tmp_path / "f.json").read_text() == "{}"
+    assert os.listdir(tmp_path) == ["f.json"]
+
+
+def test_windows_acquire_treats_delete_pending_as_contention_not_crash(tmp_path, monkeypatch):
+    monkeypatch.setattr(jq, "_IS_WINDOWS", True)
+    monkeypatch.setattr(jq, "_FS_RETRY_DELAY", 0.001)
+    real, n = os.open, []
+
+    def flaky(path, flags, *a, **k):
+        if str(path).endswith("x.lock") and len(n) < 3:
+            n.append(1)
+            raise PermissionError(13, "delete pending")
+        return real(path, flags, *a, **k)
+
+    monkeypatch.setattr(os, "open", flaky)
+    lock = FileLock(tmp_path / "x.lock", stale_after=100, poll=0.001)
+    lock.acquire()
+    monkeypatch.undo()
+    assert lock.held
+    lock.release()
+
+
+def test_posix_permission_error_on_lock_create_still_propagates(tmp_path, monkeypatch):
+    monkeypatch.setattr(jq, "_IS_WINDOWS", False)
+
+    def deny(path, flags, *a, **k):
+        raise PermissionError(13, "read-only dir")
+
+    monkeypatch.setattr(os, "open", deny)
+    with pytest.raises(PermissionError):
+        FileLock(tmp_path / "x.lock", stale_after=1).acquire()
+
+
+def test_reload_retries_transient_permission_error(qpath, monkeypatch):
+    q = JobQueue(qpath)
+    q.add("a")
+    monkeypatch.setattr(jq, "_IS_WINDOWS", True)
+    monkeypatch.setattr(jq, "_FS_RETRY_DELAY", 0.001)
+    real, n = Path.read_text, []
+
+    def flaky(self, *a, **k):
+        if self == qpath and len(n) < 2:
+            n.append(1)
+            raise PermissionError(13, "being replaced")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", flaky)
+    assert [j.id for j in q.jobs()] == ["j0001"]
+
+
+def test_lock_heartbeat_thread_keeps_long_handler_from_looking_stale(qpath):
+    """A handler that outlasts runner_stale_after (a multi-hour render) must not
+    let a second process steal the runner lock."""
+    q = JobQueue(qpath, runner_stale_after=0.4)
+    q.add("a")
+    seen = {}
+
+    def handler(ctx):
+        time.sleep(1.2)
+        # from_foreign_host: only the heartbeat age can save us
+        probe = FileLock(q._runner_lock.path, stale_after=0.4)
+        seen["holder"] = probe.holder()
+        with pytest.raises(LockHeldError):
+            JobQueue(qpath, runner_stale_after=0.4).run(reg(a=recorder([])))
+
+    q.run(reg(a=handler))
+    assert seen["holder"] is not None
+
+
+def test_runner_stops_when_its_lock_was_taken_over(qpath):
+    q = JobQueue(qpath)
+    for _ in range(3):
+        q.add("a")
+    calls = []
+
+    def handler(ctx):
+        calls.append(ctx.job.id)
+        q._runner_lock.path.write_text(json.dumps({
+            "pid": os.getpid(), "host": socket.gethostname(), "created": time.time(),
+            "heartbeat": time.time(), "token": "usurper"}))
+
+    rep = q.run(reg(a=handler))
+    assert calls == ["j0001"] and rep.stopped and rep.done == ["j0001"]
+    assert json.loads(q._runner_lock.path.read_text())["token"] == "usurper"
+
+
+def test_outcome_from_a_superseded_runner_is_discarded(qpath):
+    """Runner A is paused past its lock timeout; B takes over, recovers and
+    re-claims the job. A's late result must not overwrite B's attempt."""
+    q = JobQueue(qpath)
+    j = q.add("a")
+    events = []
+
+    def handler(ctx):
+        # simulate B: job re-claimed (attempt 2, new start time) by someone else
+        data = json.loads(qpath.read_text())
+        data["jobs"][0]["attempts"] = 2
+        data["jobs"][0]["started"] = ctx.job.started + 50
+        qpath.write_text(json.dumps(data))
+        return "late result from A"
+
+    q.run(reg(a=handler), progress=lambda e, job: events.append(e))
+    got = q.get(j.id)
+    assert got.status == "running" and got.result is None and got.attempts == 2
+    assert "discarded" in events
+
+
+def test_open_does_not_recover_when_runner_starts_during_open(qpath, monkeypatch):
+    """Between 'is a runner alive?' and the recovery write, a runner may start,
+    claim a job and hold it RUNNING legitimately."""
+    write_state(qpath, [raw_job(1, status="running", attempts=1, started=5.0)])
+    real = FileLock.acquire
+
+    def acquire(self):
+        real(self)
+        if self.path.name.endswith(".txn.lock"):
+            write_lock(self.path.with_name("queue.json.lock"), os.getpid())
+
+    monkeypatch.setattr(FileLock, "acquire", acquire)
+    q = JobQueue(qpath)
+    monkeypatch.undo()
+    assert q.get("j0001").status == "running"
+
+
+def test_recovery_failing_a_job_also_skips_its_dependents(qpath):
+    write_state(qpath, [
+        raw_job(1, status="running", attempts=3, max_attempts=3),
+        raw_job(2, depends_on=["j0001"]),
+    ])
+    q = JobQueue(qpath)
+    assert q.get("j0001").status == "failed"
+    assert q.get("j0002").status == "skipped"
+
+
+def test_backoff_far_in_the_future_after_clock_jump_is_not_slept(qpath):
+    clk = Clock(1_000_000.0)
+    write_state(qpath, [raw_job(1, not_before=clk.t + 86400)])   # clock stepped back a day
+    q = JobQueue(qpath, clock=clk, backoff_cap=300)
+    slept = []
+    calls = []
+
+    def sleep(s):
+        slept.append(s)
+        clk.advance(s)
+
+    q.run(reg(a=recorder(calls)), sleep=sleep)
+    assert calls == ["j0001"]
+    assert all(s <= 300 for s in slept)
+
+
+def test_result_is_normalised_to_what_json_round_trips_to(q):
+    j = q.add("a")
+    q.run(reg(a=lambda ctx: {1: "x", "t": (1, 2)}))
+    mem = q.get(j.id).result
+    assert mem == {"1": "x", "t": [1, 2]}
+    assert JobQueue(q.path).get(j.id).result == mem
+
+
+def test_dependents_see_the_same_result_as_the_file_holds(q):
+    a = q.add("a")
+    q.add("b", depends_on=[a])
+    seen = {}
+    q.run(reg(a=lambda ctx: {1: (1, 2)}, b=lambda ctx: seen.update(ctx.dependency_results)))
+    assert seen == {"j0001": {"1": [1, 2]}}
+
+
+def test_needs_manual_message_is_scrubbed(q):
+    j = q.add("a")
+
+    def handler(ctx):
+        raise NeedsManual("open https://x/?t=ya29.abcdefghijklmnop to authorise")
+
+    q.run(reg(a=handler))
+    assert "ya29" not in q.get(j.id).message
+    assert "ya29" not in q.path.read_text()
+
+
+def test_check_that_requests_stop_stops_the_run(q):
+    a = q.add("a")
+    r = Registry().register("a", lambda ctx: (_ for _ in ()).throw(NeedsManual("x")))
+    q.run(r)                                    # park it as waiting
+    assert q.get(a.id).status == "waiting"
+    stopper = {"on": False}
+
+    def check(ctx):
+        stopper["on"] = True
+        ctx.check_stop()
+        return True
+
+    r2 = Registry().register("a", recorder([]), check=check)
+    rep = JobQueue(q.path).run(r2, should_stop=lambda: stopper["on"])
+    assert rep.stopped
+    assert q.get(a.id).status == "waiting"
+    assert not q._runner_lock.path.exists()
+
+
+def test_next_id_never_collides_with_existing_ids(qpath):
+    write_state(qpath, [raw_job(1), raw_job(7)], next_id=2)
+    q = JobQueue(qpath)
+    new = q.add("a")
+    assert new.id == "j0008"
+    assert sorted(j.id for j in q.jobs()) == ["j0001", "j0007", "j0008"]
+
+
+def test_corrupt_file_replaced_by_good_one_during_open_is_not_quarantined(qpath, monkeypatch):
+    """Two processes both see the corrupt file; the first quarantines and
+    writes a fresh queue. The second must not then quarantine the fresh one."""
+    qpath.parent.mkdir(parents=True)
+    qpath.write_text("{ not json")
+    good = json.dumps({"version": 1, "next_id": 2, "jobs": [raw_job(1)]})
+    real = FileLock.acquire
+    fired = []
+
+    def acquire(self):
+        real(self)
+        if not fired:
+            fired.append(1)
+            qpath.write_text(good)           # the other process got there first
+
+    monkeypatch.setattr(FileLock, "acquire", acquire)
+    q = JobQueue(qpath)
+    monkeypatch.undo()
+    assert [j.id for j in q.jobs()] == ["j0001"]
+    assert q.quarantined is None
+    assert not [n for n in os.listdir(qpath.parent) if ".corrupt" in n]
+
+
+@pytest.mark.parametrize("payload", [
+    {"version": 1, "jobs": ["not a dict"]},
+    {"version": 1, "jobs": {"a": 1}},
+    {"version": 1, "jobs": [[1, 2]]},
+    {"jobs": [5]},
+])
+def test_malformed_job_entries_are_corruption_not_a_crash(qpath, payload):
+    qpath.parent.mkdir(parents=True)
+    qpath.write_text(json.dumps(payload))
+    q = JobQueue(qpath)
+    assert len(q) == 0 and q.quarantined is not None
+
+
+def test_order_scales_to_thousands_of_jobs(qpath):
+    jobs = [raw_job(i, depends_on=([] if i == 1 else ["j%04d" % (i - 1)]) if i % 3 else [])
+            for i in range(1, 3001)]
+    write_state(qpath, jobs)
+    q = JobQueue(qpath)
+    t0 = time.time()
+    for _ in range(20):
+        q.order()
+    assert time.time() - t0 < 3.0
+
+
+# ---- secret detection
+
+@pytest.mark.parametrize("name", [
+    "pass", "creds", "client_secret_json", "passwd", "access_key", "private_key",
+    "aws_secret_access_key", "authToken", "X-Api-Key", "oauth_token",
+])
+def test_more_secret_names_detected(name):
+    assert jq.is_secret_name(name)
+
+
+@pytest.mark.parametrize("name", [
+    "two_pass", "passes", "tokenizer_model", "bypass", "monkey", "keyboard",
+    "secretary", "author", "key_frames_path", "keyframes", "compass",
+])
+def test_more_non_secret_names_allowed(name):
+    assert not jq.is_secret_name(name)
+
+
+@pytest.mark.parametrize("value", [
+    "https://user:hunter2@example.com/feed",
+    "AKIAIOSFODNN7EXAMPLE",
+    "ghp_" + "a" * 36,
+    "sk-" + "A1b2C3d4" * 4,
+    "xoxb-123456789012-abcdefghijkl",
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghij",
+    "bearer abcdefghijklmnop",
+    "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+])
+def test_token_shaped_values_detected(value):
+    assert jq.find_secrets({"note": value})
+    assert jq.REDACTED in jq.redact(value)
+
+
+@pytest.mark.parametrize("value", [
+    "https://example.com/watch?v=abc",
+    "C:\\Users\\me\\Videos\\take1.mp4",
+    "my first montage: part 2",
+    "http://localhost:8080/path",
+    "mailto:someone@example.com",
+    "a-very-long-but-ordinary-title-without-secrets-in-it",
+])
+def test_ordinary_values_not_flagged(value):
+    assert not jq.find_secrets({"title": value})

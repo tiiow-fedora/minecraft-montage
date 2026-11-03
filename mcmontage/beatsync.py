@@ -27,6 +27,7 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
 import wave
 from array import array
 from bisect import bisect_left
@@ -38,6 +39,7 @@ from typing import Callable, Sequence
 DEFAULT_SAMPLE_RATE = 11025
 BEATS_PER_BAR = 4
 CACHE_VERSION = 1
+_MAX_EXTRAPOLATED_BEATS = 200_000
 _SILENCE_PEAK = 16  # int16 peak below this is treated as digital silence
 
 
@@ -87,15 +89,25 @@ class BeatGrid:
     def from_dict(cls, d: dict) -> "BeatGrid":
         try:
             beats = [float(b) for b in d["beats"]]
-            return cls(
+            grid = cls(
                 bpm=float(d["bpm"]),
                 beats=beats,
                 confidence=float(d["confidence"]),
                 strengths=[float(s) for s in d.get("strengths", [])],
                 downbeat_offset=int(d.get("downbeat_offset", 0)),
             )
-        except (KeyError, TypeError, ValueError) as e:
+        except (KeyError, TypeError, ValueError, OverflowError) as e:
             raise BeatError(f"malformed BeatGrid data: {e}") from e
+        # JSON happily round-trips NaN/Infinity, and a hand-edited or damaged
+        # cache must never feed planners an unsorted or non-finite grid.
+        numbers = [grid.bpm, grid.confidence, *grid.beats, *grid.strengths]
+        if not all(math.isfinite(v) for v in numbers):
+            raise BeatError("malformed BeatGrid data: non-finite number")
+        if grid.bpm < 0:
+            raise BeatError("malformed BeatGrid data: negative bpm")
+        if any(b2 < b1 for b1, b2 in zip(grid.beats, grid.beats[1:])):
+            raise BeatError("malformed BeatGrid data: beats not sorted")
+        return grid
 
     def dumps(self) -> str:
         return json.dumps(self.to_dict())
@@ -424,25 +436,45 @@ def estimate_tempo(
     if a0 <= 1e-12:
         return 0.0, 0.0
     acf: dict[int, float] = {}
-    for lag in range(lag_lo, 2 * lag_hi + 1):
+    for lag in range(max(1, lag_lo - 1), 4 * lag_hi + 2):
         if lag >= m // 2:
             acf[lag] = 0.0
         else:
             acf[lag] = sum(map(mul, x, x[lag:])) / (m - lag) / a0
 
+    def peak(lag: int) -> float:
+        # A beat period is rarely a whole number of frames. Sampling the ACF at
+        # integer lags alone favours periods whose multiples happen to fall
+        # near an integer (e.g. 1.5 beats at 145 BPM beats 1 beat, giving a
+        # 3:2 tempo error), so read the local peak height instead.
+        return max(acf.get(lag - 1, 0.0), acf.get(lag, 0.0), acf.get(lag + 1, 0.0))
+
     def score(lag: int) -> float:
         bpm = 60.0 * rate / lag
         prior = math.exp(-0.5 * (math.log2(bpm / prior_bpm) / prior_octaves) ** 2)
-        return prior * (acf[lag] + 0.5 * acf.get(2 * lag, 0.0))
+        return prior * (peak(lag) + 0.5 * peak(2 * lag) + 0.25 * peak(4 * lag))
+
+    def raw(lag: int) -> float:
+        return peak(lag) + 0.5 * peak(2 * lag) + 0.25 * peak(4 * lag)
 
     best = max(range(lag_lo, lag_hi + 1), key=score)
+    # 3:2 guard. A period of 1.5 beats is as periodic as the beat itself in any
+    # groove with eighth-note hats, and the 120-BPM prior then tips the choice
+    # toward it (e.g. 155 BPM reported as 103). Unlike a 2x octave this is never
+    # a musically valid answer, so prefer the shorter period when it is about
+    # as strong without the prior.
+    alt = int(round(best * 2.0 / 3.0))
+    if alt >= lag_lo:
+        alt = max(range(alt - 1, alt + 2), key=raw)
+        if alt >= lag_lo and raw(alt) >= 0.95 * raw(best):
+            best = alt
     frac = float(best)
     if lag_lo < best < lag_hi:
         y0, y1, y2 = score(best - 1), score(best), score(best + 1)
         den = y0 - 2 * y1 + y2
         if den < 0:
             frac = best + 0.5 * (y0 - y2) / den
-    return 60.0 * rate / frac, max(0.0, min(1.0, acf[best]))
+    return 60.0 * rate / frac, max(0.0, min(1.0, peak(best)))
 
 
 def track_beats(
@@ -585,6 +617,12 @@ def extrapolate_beats(grid: BeatGrid, until_s: float) -> list[float]:
         return beats
     gaps = sorted(b - a for a, b in zip(beats, beats[1:]))
     period = gaps[len(gaps) // 2]
+    if not period > 0 or not math.isfinite(until_s):
+        return beats          # degenerate grid: nothing sensible to continue
+    if (until_s - beats[-1]) / period > _MAX_EXTRAPOLATED_BEATS:
+        raise BeatError(
+            f"refusing to extrapolate {(until_s - beats[-1]) / period:.0f} beats "
+            f"at a {period:.6f}s period")
     while beats[-1] + period <= until_s:
         beats.append(beats[-1] + period)
     return beats
@@ -645,10 +683,11 @@ def plan_cuts(
     ``downbeat_weight`` extra (in squared-relative-length units).
     If total_s < min_clip_s a single cut is returned (min can't be honoured).
     """
-    if total_s <= 0:
-        raise BeatError("total_s must be positive")
-    if min_clip_s <= 0 or max_clip_s < min_clip_s:
-        raise BeatError("need 0 < min_clip_s <= max_clip_s")
+    if not (math.isfinite(total_s) and total_s > 0):
+        raise BeatError("total_s must be positive and finite")
+    if not (math.isfinite(min_clip_s) and math.isfinite(max_clip_s)
+            and 0 < min_clip_s <= max_clip_s):
+        raise BeatError("need 0 < min_clip_s <= max_clip_s (finite)")
     if clip_durations is not None and (
         not clip_durations or any(d <= 0 for d in clip_durations)
     ):
@@ -717,8 +756,10 @@ def fit_clips_to_beats(
     """
     if not durations:
         return []
-    if any(d <= 0 for d in durations):
-        raise BeatError("durations must be positive")
+    if any(not (math.isfinite(d) and d > 0) for d in durations):
+        raise BeatError("durations must be positive and finite")
+    if not math.isfinite(start_s):
+        raise BeatError("start_s must be finite")
     _check_sorted(beats)
     K = len(durations)
     first = bisect_left(beats, start_s + 1e-9)
@@ -799,6 +840,8 @@ def cuts_for_highlights(
     n = len(highlight_scores)
     if n == 0:
         return []
+    if not (math.isfinite(total_s) and total_s > 0):
+        raise BeatError("total_s must be positive and finite")
     _check_sorted(beats)
     usable = [(i, t) for i, t in enumerate(beats) if 1e-9 < t < total_s - 1e-9]
     steps = len(usable) + 1  # beat-to-beat intervals, counting 0 and total_s as ends
@@ -834,18 +877,33 @@ def _fingerprint(path: Path) -> dict:
     return {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
 
 
-def save_cache(music_path, grid: BeatGrid) -> Path | None:
+def save_cache(music_path, grid: BeatGrid, fingerprint: dict | None = None) -> Path | None:
     """Write the cache atomically; returns None (not an error) if the
-    directory is read-only, since caching is only an optimisation."""
+    directory is read-only, since caching is only an optimisation.
+
+    ``fingerprint`` should be the file's fingerprint from *before* analysis
+    started: stamping it afterwards would bless a grid computed from different
+    bytes if the file was replaced mid-analysis."""
     music_path = Path(music_path)
     cp = cache_path_for(music_path)
-    payload = {"version": CACHE_VERSION, "source": _fingerprint(music_path), "grid": grid.to_dict()}
-    tmp = cp.with_name(cp.name + ".tmp")
+    tmp = None
     try:
-        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        payload = {"version": CACHE_VERSION,
+                   "source": fingerprint or _fingerprint(music_path), "grid": grid.to_dict()}
+        fd, tmp_name = tempfile.mkstemp(dir=str(cp.parent), prefix=cp.name + ".", suffix=".tmp")
+        tmp = Path(tmp_name)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload))
         os.replace(tmp, cp)
+        tmp = None
     except OSError:
         return None
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
     return cp
 
 
@@ -880,6 +938,10 @@ def load_or_detect(
         cached = load_cache(music_path)
         if cached is not None:
             return cached
+    try:
+        before = _fingerprint(music_path)
+    except OSError as e:
+        raise BeatError(f"cannot stat audio file {music_path}: {e}") from e
     grid = detect(music_path)
-    save_cache(music_path, grid)
+    save_cache(music_path, grid, before)
     return grid

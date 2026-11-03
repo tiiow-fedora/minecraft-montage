@@ -32,6 +32,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import hashlib
+import heapq
 import json
 import os
 import re
@@ -122,7 +123,12 @@ _SECRET_TOKENS = frozenset({
     "pwd", "passphrase", "key", "keys", "apikey", "credential", "credentials",
     "auth", "authorization", "bearer", "cookie", "cookies",
 })
-_SECRET_SUBSTRINGS = ("token", "secret", "password", "apikey", "passphrase")
+# Fused spellings (accesstoken, clientsecret, userpassword, xapikey, ...). Matched
+# at the END of a name part only, so "tokenizer" and "secretary" stay allowed.
+_SECRET_SUFFIXES = ("token", "secret", "password", "passwd", "apikey", "passphrase",
+                    "secretkey", "privatekey", "accesskey", "authkey", "signingkey")
+# Names that are secret only when they are the whole name ("pass" yes, "two_pass" no).
+_SECRET_WHOLE_NAMES = frozenset({"pass", "pw", "creds", "cred"})
 # A name ending in one of these is a *reference* to a secret, not the secret.
 _REFERENCE_SUFFIXES = frozenset({"ref", "path", "file", "env", "name", "id", "url", "var"})
 _VALUE_PATTERNS = re.compile(
@@ -130,8 +136,16 @@ _VALUE_PATTERNS = re.compile(
     r"|1//[0-9A-Za-z_\-]{20,}"               # Google refresh token
     r"|AIza[0-9A-Za-z_\-]{30,}"              # Google API key
     r"|GOCSPX-[0-9A-Za-z_\-]+"               # Google client secret
-    r"|Bearer\s+[0-9A-Za-z._\-]{10,}"
-    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----)"
+    r"|(?i:bearer)\s+[0-9A-Za-z._\-]{10,}"
+    r"|(?i:authorization):\s*\w+\s+\S{8,}"
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    r"|(?<=://)[^/\s:@]+:[^/\s@]+@"           # user:password@host
+    r"|\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"          # AWS access key id
+    r"|\bgh[pousr]_[0-9A-Za-z]{30,}"            # GitHub tokens
+    r"|\bsk-(?:proj-|ant-)?[0-9A-Za-z_\-]{20,}\b"  # OpenAI/Anthropic style keys
+    r"|\bxox[abprs]-[0-9A-Za-z\-]{10,}"         # Slack tokens
+    r"|\beyJ[0-9A-Za-z_\-]{8,}\.[0-9A-Za-z_\-]{8,}\.[0-9A-Za-z_\-]{4,}"  # JWT
+    r")"
 )
 REDACTED = "***REDACTED***"
 
@@ -152,7 +166,15 @@ def is_secret_name(name: str) -> bool:
     if any(p in _SECRET_TOKENS for p in parts):
         return True
     joined = "".join(parts)
-    return any(s in joined for s in _SECRET_SUBSTRINGS)
+    if joined in _SECRET_WHOLE_NAMES:
+        return True
+    for p in parts:
+        p = p.rstrip("0123456789")
+        if p.endswith("s"):
+            p = p[:-1]
+        if p.endswith(_SECRET_SUFFIXES):
+            return True
+    return any(joined.endswith(x) for x in _SECRET_SUFFIXES)
 
 
 def find_secrets(obj: Any, _path: str = "") -> list[str]:
@@ -301,33 +323,94 @@ class RunReport:
 # --------------------------------------------------------------------------
 # cross-platform process / lock helpers
 
+_IS_WINDOWS = os.name == "nt"
+_FS_RETRY_DELAY = 0.025
+_FS_RETRY_ATTEMPTS = 40          # ~1s: how long a Windows sharing violation may last
+
+
+def _retry_fs(fn: Callable[[], Any]) -> Any:
+    """Run a filesystem call, retrying PermissionError on Windows only.
+
+    Windows refuses to rename/delete a file that another process has open (and
+    a freshly deleted file stays "delete pending" until every handle closes),
+    which surfaces as PermissionError. Our lock and queue files are read by
+    other processes all the time, so these are transient. On POSIX a
+    PermissionError is real and propagates immediately.
+    """
+    for attempt in range(_FS_RETRY_ATTEMPTS):
+        try:
+            return fn()
+        except PermissionError:
+            if not _IS_WINDOWS or attempt == _FS_RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep(_FS_RETRY_DELAY)
+
+
+def _read_text(path: Path) -> str:
+    return _retry_fs(lambda: Path(path).read_text(encoding="utf-8"))
+
+
+def _pid_alive_windows(pid: int, kernel32: Any, get_last_error: Callable[[], int]) -> bool:
+    """Windows liveness probe, split out so it can be tested with a fake."""
+    import ctypes
+
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        # 5 = ERROR_ACCESS_DENIED (exists, not ours); 87 = ERROR_INVALID_PARAMETER (gone)
+        return get_last_error() == 5
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True
+        return code.value == 259  # STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _windows_kernel32() -> Any:
+    import ctypes
+    from ctypes import wintypes
+
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    # Without argtypes/restype ctypes truncates 64-bit HANDLEs to a C int.
+    k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k.OpenProcess.restype = wintypes.HANDLE
+    k.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    k.GetExitCodeProcess.restype = wintypes.BOOL
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    k.CloseHandle.restype = wintypes.BOOL
+    return k
+
+
+def _is_zombie(pid: int) -> bool:
+    """Linux: exited but not yet reaped by its parent. kill(pid, 0) succeeds on
+    those, which would make a crashed runner's lock look held (e.g. under a
+    container PID 1 that never reaps)."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            stat = fh.read().decode("ascii", "replace")
+        return stat.rsplit(")", 1)[1].split()[0] in ("Z", "X")
+    except (OSError, IndexError):
+        return False
+
+
 def _pid_alive(pid: int) -> bool:
     """Is a process with this pid running? Works on Windows and POSIX."""
-    if pid <= 0:
+    if not isinstance(pid, int) or pid <= 0 or pid > 0xFFFFFFFF:
         return False
-    if os.name == "nt":
+    if _IS_WINDOWS:
         import ctypes
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
-        if not handle:
-            return ctypes.get_last_error() == 5  # access denied => exists
-        try:
-            code = ctypes.c_ulong()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                return True
-            return code.value == 259  # STILL_ACTIVE
-        finally:
-            kernel32.CloseHandle(handle)
+        return _pid_alive_windows(pid, _windows_kernel32(), ctypes.get_last_error)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
-    except OSError:
+    except (OSError, OverflowError, ValueError):
         return False
-    return True
+    return not _is_zombie(pid)
 
 
 class FileLock:
@@ -335,6 +418,11 @@ class FileLock:
 
     Chosen over fcntl/msvcrt so one code path serves both OSes and so the lock
     carries diagnostics (who holds it, since when) a user can read.
+
+    Taking over a stale lock is done by *renaming* it to a private name and then
+    re-checking what we actually moved. Unlinking by path would be a
+    check-then-act race: two waiters both judge the same stale file stale, one
+    finishes a full takeover, and the other then deletes the new live lock.
     """
 
     def __init__(
@@ -353,11 +441,14 @@ class FileLock:
         self.clock = clock
         self.token = f"{os.getpid()}-{id(self)}-{time.time_ns()}"
         self.held = False
+        self.lost = False   # set when a heartbeat finds someone else owns the file
+        # heartbeat() may run on a background thread while release() runs
+        self._mutex = threading.RLock()
 
     # -- inspection
-    def _read(self) -> Optional[dict]:
+    def _read(self, path: Optional[Path] = None) -> Optional[dict]:
         try:
-            raw = self.path.read_text(encoding="utf-8")
+            raw = _read_text(path or self.path)
         except FileNotFoundError:
             return None
         except OSError:
@@ -368,13 +459,13 @@ class FileLock:
         except ValueError:
             return {}
 
-    def _is_stale(self, info: dict) -> bool:
+    def _is_stale(self, info: dict, path: Optional[Path] = None) -> bool:
         now = self.clock()
         if not info:
             # Unreadable/empty: probably mid-creation by another process. Only
             # treat as stale once it has had ample time to be written.
             try:
-                age = time.time() - self.path.stat().st_mtime
+                age = time.time() - (path or self.path).stat().st_mtime
             except OSError:
                 return False
             return age > 2.0
@@ -403,8 +494,42 @@ class FileLock:
             "created": now, "heartbeat": now, "token": self.token,
         })
 
+    def _break_stale(self, seen: dict) -> None:
+        """Remove the lock file we judged stale, without ever removing a live one."""
+        victim = self.path.with_name(f"{self.path.name}.stale-{self.token}")
+        try:
+            _retry_fs(lambda: os.rename(self.path, victim))
+        except FileNotFoundError:
+            return                       # someone else already broke it
+        except OSError:
+            return                       # still in use; the caller re-polls
+        moved = self._read(victim)
+        if moved is None or self._is_stale(moved, victim):
+            try:
+                os.unlink(victim)
+            except OSError:
+                pass
+            return
+        # We moved a lock that is NOT stale (the owner took over / refreshed it
+        # between our check and the rename). Put it back unless someone has
+        # already created a new one (os.link never overwrites).
+        try:
+            os.link(victim, self.path)
+        except (OSError, NotImplementedError, AttributeError):
+            if not self.path.exists():
+                try:
+                    os.rename(victim, self.path)
+                    return
+                except OSError:
+                    pass
+        try:
+            os.unlink(victim)
+        except OSError:
+            pass
+
     def acquire(self) -> None:
         deadline = time.monotonic() + self.timeout
+        perm_until: Optional[float] = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         while True:
             try:
@@ -414,54 +539,70 @@ class FileLock:
                 if info is None:
                     continue  # vanished between open and read; retry
                 if self._is_stale(info):
-                    # Re-check just before unlinking so we don't delete a lock
-                    # someone else just took over.
-                    if self._read() == info:
-                        try:
-                            os.unlink(self.path)
-                        except OSError:
-                            pass
+                    self._break_stale(info)
                     continue
                 if time.monotonic() >= deadline:
+                    created = info.get("created", 0)
+                    try:
+                        when = time.strftime("%Y-%m-%d %H:%M:%S",
+                                             time.localtime(float(created)))
+                    except (TypeError, ValueError, OverflowError, OSError):
+                        when = "?"
                     raise LockHeldError(
                         "locked by pid %s on %s since %s (%s)"
-                        % (info.get("pid"), info.get("host"),
-                           time.strftime("%Y-%m-%d %H:%M:%S",
-                                         time.localtime(info.get("created", 0))),
-                           self.path)
+                        % (info.get("pid"), info.get("host"), when, self.path)
                     )
                 time.sleep(self.poll)
+                continue
+            except PermissionError:
+                # Windows reports "file exists but is delete-pending / open
+                # without share-delete" as access denied rather than EEXIST.
+                if not _IS_WINDOWS:
+                    raise
+                now = time.monotonic()
+                if perm_until is None:
+                    perm_until = now + _FS_RETRY_DELAY * _FS_RETRY_ATTEMPTS
+                if now >= max(deadline, perm_until):
+                    raise LockHeldError(f"lock file is busy ({self.path})") from None
+                time.sleep(max(self.poll, _FS_RETRY_DELAY))
                 continue
             try:
                 os.write(fd, self._payload().encode("utf-8"))
             finally:
                 os.close(fd)
             self.held = True
+            self.lost = False
             return
 
     def heartbeat(self) -> None:
-        """Refresh the timestamp so a long-lived holder is never judged stale."""
-        if not self.held:
-            return
-        info = self._read()
-        if not info or info.get("token") != self.token:
-            return
-        info["heartbeat"] = self.clock()
-        try:
-            _atomic_write_text(self.path, json.dumps(info), fsync=False)
-        except OSError:
-            pass
-
-    def release(self) -> None:
-        if not self.held:
-            return
-        self.held = False
-        info = self._read()
-        if info and info.get("token") == self.token:
+        """Refresh the timestamp so a long-lived holder is never judged stale.
+        Sets ``lost`` if the file now belongs to someone else (or is gone)."""
+        with self._mutex:
+            if not self.held:
+                return
+            info = self._read()
+            if info is None or (info and info.get("token") != self.token):
+                self.lost = True
+                return
+            if not info:
+                return                   # unreadable right now; try next beat
+            info["heartbeat"] = self.clock()
             try:
-                os.unlink(self.path)
+                _atomic_write_text(self.path, json.dumps(info), fsync=False)
             except OSError:
                 pass
+
+    def release(self) -> None:
+        with self._mutex:
+            if not self.held:
+                return
+            self.held = False
+            info = self._read()
+            if info and info.get("token") == self.token:
+                try:
+                    _retry_fs(lambda: os.unlink(self.path))
+                except OSError:
+                    pass
 
     def __enter__(self) -> "FileLock":
         self.acquire()
@@ -487,7 +628,7 @@ def _atomic_write_text(path: Path, text: str, *, fsync: bool = True) -> None:
             fh.flush()
             if fsync:
                 os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        _retry_fs(lambda: os.replace(tmp, path))
     except BaseException:
         try:
             os.unlink(tmp)
@@ -592,8 +733,11 @@ class JobQueue:
             self._reload()
             if recover and any(j.status == RUNNING for j in self._jobs.values()):
                 # Only if no live runner owns them; otherwise "running" is true.
-                if self._runner_lock.holder() is None:
-                    with self._txn():
+                # The check must happen INSIDE the txn: a runner that starts
+                # between an outside check and the write would otherwise have
+                # its legitimately-running job reset and run twice.
+                with self._txn():
+                    if self._runner_lock.holder() is None:
                         self._recover_running()
 
     # ---- persistence ----------------------------------------------------
@@ -603,32 +747,63 @@ class JobQueue:
         while dest.exists():
             n += 1
             dest = base.with_name(f"{base.name}.{n}")
-        os.replace(self.path, dest)
+        _retry_fs(lambda: os.replace(self.path, dest))
         self.quarantined = dest
         return dest
 
+    def _quarantine_if_unchanged(self, raw: str) -> bool:
+        """Move the corrupt file aside, but only while holding the txn lock and
+        only if it still holds exactly the bytes we judged corrupt. Otherwise
+        another process has already replaced it with a good file, and moving
+        that would destroy its data. Returns False if the file changed."""
+        taken = False
+        if self._depth == 0:
+            self._txn_lock.acquire()
+            taken = True
+        try:
+            try:
+                current = _read_text(self.path)
+            except FileNotFoundError:
+                return True
+            if current != raw:
+                return False
+            self._quarantine()
+            return True
+        finally:
+            if taken:
+                self._txn_lock.release()
+
     def _reload(self) -> None:
-        try:
-            raw = self.path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            self._jobs, self._next_id = {}, 1
+        for _ in range(5):
+            try:
+                raw = _read_text(self.path)
+            except FileNotFoundError:
+                self._jobs, self._next_id = {}, 1
+                return
+            try:
+                state = migrate(json.loads(raw))
+                jobs = [Job.from_dict(d) for d in state["jobs"]]
+                next_id = int(state.get("next_id", len(jobs) + 1))
+            except SchemaVersionError:
+                raise
+            except (ValueError, TypeError, KeyError, AttributeError, CorruptStateError) as exc:
+                if self.on_corrupt == "raise":
+                    raise CorruptStateError(
+                        f"{self.path} is corrupt ({exc}); move it aside or open the "
+                        f"queue with on_corrupt='quarantine' to start fresh") from exc
+                if not self._quarantine_if_unchanged(raw):
+                    continue                 # someone fixed it meanwhile; re-read
+                self._jobs, self._next_id = {}, 1
+                return
+            self._jobs = {j.id: j for j in jobs}
+            highest = 0
+            for jid in self._jobs:
+                m = re.fullmatch(r"j(\d+)", jid)
+                if m:
+                    highest = max(highest, int(m.group(1)))
+            self._next_id = max(next_id, highest + 1, 1)
             return
-        try:
-            state = migrate(json.loads(raw))
-            jobs = [Job.from_dict(d) for d in state["jobs"]]
-            next_id = int(state.get("next_id", len(jobs) + 1))
-        except SchemaVersionError:
-            raise
-        except (ValueError, TypeError, KeyError, CorruptStateError) as exc:
-            if self.on_corrupt == "raise":
-                raise CorruptStateError(
-                    f"{self.path} is corrupt ({exc}); move it aside or open the "
-                    f"queue with on_corrupt='quarantine' to start fresh") from exc
-            dest = self._quarantine()
-            self._jobs, self._next_id = {}, 1
-            return
-        self._jobs = {j.id: j for j in jobs}
-        self._next_id = max(next_id, 1)
+        raise CorruptStateError(f"{self.path} keeps changing while being read")
 
     def _save(self) -> None:
         state = {
@@ -701,6 +876,7 @@ class JobQueue:
                 job.not_before = 0.0
                 revived.append(job.id)
             self._touch(job)
+        self._propagate_skips()         # dependents of a job that just failed
         return revived
 
     # ---- adding / lookup -----------------------------------------------
@@ -821,18 +997,19 @@ class JobQueue:
                     indeg[j.id] += 1
                     children[d].append(j.id)
         position = {i: n for n, i in enumerate(self._jobs)}
-        ready = sorted((i for i, n in indeg.items() if n == 0), key=position.get)
+        ready = [(position[i], i) for i, n in indeg.items() if n == 0]
+        heapq.heapify(ready)
         out: list[str] = []
         while ready:
-            cur = ready.pop(0)
+            _, cur = heapq.heappop(ready)
             out.append(cur)
             for c in children[cur]:
                 indeg[c] -= 1
                 if indeg[c] == 0:
-                    ready.append(c)
-            ready.sort(key=position.get)
+                    heapq.heappush(ready, (position[c], c))
         if len(out) != len(self._jobs):
-            stuck = [i for i in self._jobs if i not in set(out)]
+            done_ids = set(out)
+            stuck = [i for i in self._jobs if i not in done_ids]
             raise CycleError("dependency cycle among jobs: " + ", ".join(stuck))
         return out
 
@@ -926,9 +1103,9 @@ class JobQueue:
 
     def reset(self) -> int:
         """Delete every job. Refuses while a live runner exists."""
-        if self._runner_lock.holder() is not None and not self._runner_lock.held:
-            raise LockHeldError("a runner is active; stop it before reset()")
         with self._txn():
+            if self._runner_lock.holder() is not None and not self._runner_lock.held:
+                raise LockHeldError("a runner is active; stop it before reset()")
             n = len(self._jobs)
             self._jobs.clear()
             self._next_id = 1
@@ -994,6 +1171,17 @@ class JobQueue:
         runner = self._runner_lock
         runner.timeout = lock_timeout
         runner.acquire()
+        # A handler may run for hours; without a background beat the lock would
+        # look stale (by age) to every other process and be taken over.
+        beat_stop = threading.Event()
+        beat_every = max(0.05, min(30.0, runner.stale_after / 4.0))
+
+        def beat() -> None:
+            while not beat_stop.wait(beat_every):
+                runner.heartbeat()
+
+        beater = threading.Thread(target=beat, name="jobqueue-heartbeat", daemon=True)
+        beater.start()
         try:
             with self._view():
                 order_ids = self._order()  # cycle check up front
@@ -1009,6 +1197,12 @@ class JobQueue:
 
             while True:
                 runner.heartbeat()
+                if runner.lost:
+                    # Another process took over our lock (we were suspended past
+                    # the stale timeout). Running on would double-run its jobs.
+                    logf("runner lock was taken over by another process; stopping")
+                    report.stopped = True
+                    break
                 if should_stop is not None and should_stop():
                     report.stopped = True
                     break
@@ -1026,6 +1220,9 @@ class JobQueue:
                         ctx = self._make_ctx(j, logf, should_stop)
                         try:
                             ok = bool(registry.check_for(j.kind)(ctx))
+                        except StopRequested:
+                            report.stopped = True
+                            break
                         except Exception as exc:
                             logf(f"check for {j.id} raised {exc!r}; staying waiting")
                             ok = False
@@ -1036,6 +1233,8 @@ class JobQueue:
                                     cur.status = PENDING
                                     cur.message = None
                                     self._touch(cur)
+                    if report.stopped:
+                        break
                     continue
 
                 claimed, wait = self._claim(sleep is not None)
@@ -1051,18 +1250,20 @@ class JobQueue:
                 outcome: tuple
                 try:
                     result = registry.get(job.kind)(ctx)
-                    json.dumps(result)
-                    outcome = ("done", result)
+                    # Normalise to exactly what the file will hold (tuple->list,
+                    # int keys->str) so dependents see the same value before and
+                    # after a reload; also rejects non-serialisable results.
+                    outcome = ("done", json.loads(json.dumps(result)))
                 except NeedsManual as nm:
                     outcome = ("waiting", nm.message)
                 except StopRequested:
                     outcome = ("stopped", None)
                 except KeyboardInterrupt:
-                    self._finish(job.id, ("stopped", None), report, emit)
+                    self._finish(job, ("stopped", None), report, emit)
                     raise
                 except Exception as exc:
                     outcome = ("error", exc)
-                self._finish(job.id, outcome, report, emit)
+                self._finish(job, outcome, report, emit)
                 if outcome[0] == "waiting":
                     polled.add(job.id)  # it just told us it is not ready
                 if outcome[0] == "stopped":
@@ -1071,6 +1272,8 @@ class JobQueue:
                 if outcome[0] == "error" and stop_on_error and report.failed:
                     break
         finally:
+            beat_stop.set()
+            beater.join(timeout=5.0)
             runner.release()
         with self._view():
             report.waiting = [j.id for j in self._jobs.values() if j.status == WAITING]
@@ -1090,10 +1293,13 @@ class JobQueue:
                 job = self._jobs[jid]
                 if job.status != PENDING:
                     continue
-                if any(self._jobs[d].status != DONE for d in job.depends_on):
+                if any(getattr(self._jobs.get(d), "status", None) != DONE for d in job.depends_on):
                     continue
-                if honour_backoff and job.not_before > now:
-                    delay = job.not_before - now
+                delay = job.not_before - now
+                # A delay longer than the cap cannot have come from our own
+                # backoff: the wall clock was stepped back since it was
+                # recorded. Waiting it out would stall for hours/days.
+                if honour_backoff and 0 < delay <= self.backoff_cap:
                     soonest = delay if soonest is None else min(soonest, delay)
                     continue
                 job.status = RUNNING
@@ -1105,12 +1311,16 @@ class JobQueue:
                 return (job.copy(), deps), None
             return None, soonest
 
-    def _finish(self, jid: str, outcome: tuple, report: RunReport, emit: Callable) -> None:
+    def _finish(self, claimed: Job, outcome: tuple, report: RunReport, emit: Callable) -> None:
+        jid = claimed.id
         kind, payload = outcome
         with self._txn():
             job = self._jobs.get(jid)
-            if job is None or job.status != RUNNING:
-                # Cancelled/removed by someone else while it ran: their word wins.
+            if (job is None or job.status != RUNNING
+                    or job.attempts != claimed.attempts or job.started != claimed.started):
+                # Cancelled/removed by someone else while it ran, or re-claimed
+                # by a runner that took over our lock (different attempt/start):
+                # their word wins, never overwrite their attempt with ours.
                 if job is not None:
                     emit("discarded", job.copy())
                 return
@@ -1127,7 +1337,7 @@ class JobQueue:
             elif kind == "waiting":
                 job.status = WAITING
                 job.attempts = max(0, job.attempts - 1)  # not a failed attempt
-                job.message = str(payload)
+                job.message = _scrub_error(str(payload))
                 job.resumed = False
                 event = "waiting"
             elif kind == "stopped":

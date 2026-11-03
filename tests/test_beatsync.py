@@ -834,3 +834,312 @@ def test_detect_beats_end_to_end_with_lavfi_click_track(tmp_path):
     g2 = bs.load_or_detect(p)
     assert bs.load_or_detect(p) == g2
     assert bs.cache_path_for(p).is_file()
+
+
+# ===========================================================================
+# Adversarial review additions: realistic drum grooves, drift, meter, MP3,
+# a full-length track for performance, and robustness of the helpers.
+# ===========================================================================
+
+import functools
+import os
+import statistics
+import time
+
+
+@functools.lru_cache(maxsize=4)
+def _drum_templates(sr: int):
+    rng = random.Random(7)
+
+    def kick():
+        out, ph = [], 0.0
+        for i in range(int(0.25 * sr)):
+            t = i / sr
+            ph += 2 * math.pi * (45 + 90 * math.exp(-t / 0.03)) / sr
+            out.append(math.sin(ph) * math.exp(-t / 0.09))
+        return out
+
+    def snare():
+        return [(0.6 * rng.uniform(-1, 1) + 0.4 * math.sin(2 * math.pi * 190 * i / sr))
+                * math.exp(-i / sr / 0.05) for i in range(int(0.2 * sr))]
+
+    def hat():
+        return [rng.uniform(-1, 1) * math.exp(-i / sr / 0.012) for i in range(int(0.06 * sr))]
+
+    return {"k": kick(), "s": snare(), "h": hat()}
+
+
+# (position within the bar in beats, instrument, amplitude)
+ROCK_44 = [(0, "k", 1.0), (0.5, "h", .3), (1, "s", .8), (1.5, "h", .3), (2, "k", .9),
+           (2.5, "k", .7), (2.5, "h", .3), (3, "s", .8), (3.5, "h", .3)]
+# kick/snare on the beats with 16th-note syncopation around them
+FUNK_44 = [(0, "k", 1.0), (0.5, "h", .25), (0.75, "k", .6), (1, "s", .9), (1.5, "h", .25),
+           (2, "k", .9), (2.5, "h", .25), (2.75, "k", .6), (3, "s", .9), (3.5, "h", .25),
+           (3.75, "h", .25)]
+WALTZ_34 = [(0, "k", 1.0), (0.5, "h", .3), (1, "s", .6), (1.5, "h", .3), (2, "s", .6), (2.5, "h", .3)]
+# every hit between the beats: no energy on the beat itself
+OFFBEAT_44 = [(0.5, "h", .6), (1.5, "s", .8), (2.5, "h", .6), (3.5, "s", .8), (1.75, "k", .7)]
+
+
+def groove(bpm, dur, pattern, per_bar=4, drift=0.0, drift_period=30.0, sr=SR,
+           seed=1, noise=0.02, lead=0.5, jitter=0.0):
+    """Drum-machine style track. Tempo may wander sinusoidally by +-``drift``.
+    Returns (samples, true quarter-note times)."""
+    rng = random.Random(seed)
+    tp = _drum_templates(sr)
+    n = int(dur * sr)
+    x = [0.0] * n
+    beats, t = [], lead
+    while t < dur - 0.3:
+        beats.append(t)
+        t += 60.0 / (bpm * (1 + drift * math.sin(2 * math.pi * t / drift_period)))
+    for bi, bt in enumerate(beats):
+        nxt = beats[bi + 1] if bi + 1 < len(beats) else bt + 60.0 / bpm
+        for pos, inst, amp in pattern:
+            if int(pos) != bi % per_bar:
+                continue
+            s = int((bt + (pos - int(pos)) * (nxt - bt) + rng.gauss(0, jitter)) * sr)
+            tpl = tp[inst]
+            for i in range(min(len(tpl), n - s)):
+                x[s + i] += amp * tpl[i]
+    if noise:
+        x = [v + rng.uniform(-noise, noise) for v in x]
+    pk = max(abs(v) for v in x) or 1.0
+    return array("h", (int(v / pk * 0.8 * 32767) for v in x)), beats
+
+
+@functools.lru_cache(maxsize=32)
+def _groove_grid(bpm, dur, pattern_name, per_bar, drift, drift_period, jitter, seed):
+    pat = {"rock": ROCK_44, "funk": FUNK_44, "waltz": WALTZ_34, "offbeat": OFFBEAT_44}[pattern_name]
+    x, truth = groove(bpm, dur, pat, per_bar, drift, drift_period, jitter=jitter, seed=seed)
+    return bs.analyse_samples(x, SR), truth
+
+
+@pytest.mark.parametrize("bpm", [95, 105, 120, 135, 145, 155, 165, 175])
+def test_drum_groove_tempo_and_beats_constant_tempo(bpm):
+    """Regression: with eighth-note hats, 145-175 BPM used to come out as 2/3 of
+    the true tempo (a 1.5-beat period) because integer-lag autocorrelation
+    favours periods whose multiples land near whole frames."""
+    g, truth = _groove_grid(bpm, 40, "rock", 4, 0.0, 30.0, 0.004, bpm)
+    assert g.bpm == pytest.approx(bpm, rel=0.02)
+    rec, pre = match(g.beats, truth, 0.07)
+    assert rec >= 0.95 and pre >= 0.95
+
+
+@pytest.mark.parametrize("bpm", [90, 110, 128, 160])
+@pytest.mark.parametrize("drift", [0.02, -0.02])
+def test_drum_groove_follows_two_percent_tempo_drift(bpm, drift):
+    g, truth = _groove_grid(bpm, 50, "rock", 4, drift, 25.0, 0.004, 3)
+    # on slow tracks a double-time answer (octave) is acceptable by contract
+    assert octave_equiv(g.bpm, bpm, 0.03)
+    if abs(g.bpm - bpm) / bpm < 0.03:
+        rec, pre = match(g.beats, truth, 0.07)
+        assert rec >= 0.95 and pre >= 0.95
+    else:  # double time: every true beat must still be hit
+        rec, _ = match(g.beats, truth, 0.07)
+        assert rec >= 0.95
+
+
+@pytest.mark.parametrize("bpm", [100, 128, 140])
+def test_syncopated_funk_groove_locks_on_the_beat(bpm):
+    g, truth = _groove_grid(bpm, 45, "funk", 4, 0.0, 30.0, 0.005, 5)
+    assert g.bpm == pytest.approx(bpm, rel=0.02)
+    rec, pre = match(g.beats, truth, 0.07)
+    assert rec >= 0.95 and pre >= 0.95
+
+
+def test_offbeat_only_groove_has_right_tempo_and_regular_grid():
+    """No energy on the beat at all: locking to the off-beat is the only thing an
+    onset tracker can do. Tempo and regularity must still be right, and the
+    phase must be on the beat or exactly half a beat away, never arbitrary."""
+    g, truth = _groove_grid(120, 40, "offbeat", 4, 0.0, 30.0, 0.0, 2)
+    assert g.bpm == pytest.approx(120, rel=0.02)
+    per = 0.5
+    gaps = [b - a for a, b in zip(g.beats, g.beats[1:])]
+    assert max(gaps) - min(gaps) < 0.03
+    phase = statistics.median([((b - truth[0] + per / 2) % per) - per / 2 for b in g.beats])
+    assert min(abs(phase), abs(abs(phase) - per / 2)) < 0.03
+
+
+@pytest.mark.parametrize("bpm", [90, 120, 150])
+def test_three_four_meter_beats_are_found(bpm):
+    g, truth = _groove_grid(bpm, 45, "waltz", 3, 0.0, 30.0, 0.004, 9)
+    assert g.bpm == pytest.approx(bpm, rel=0.02)
+    rec, pre = match(g.beats, truth, 0.07)
+    assert rec >= 0.95 and pre >= 0.95
+    # Downbeats are documented as 4/4-only; for 3/4 they must still be a valid,
+    # in-range selection that planning can consume without error.
+    assert 0 <= g.downbeat_offset < bs.BEATS_PER_BAR
+    cuts = bs.plan_cuts(g.beats, 30.0, 1.0, 6.0, downbeat_offset=g.downbeat_offset)
+    assert cuts[0].start_s == 0.0 and cuts[-1].end_s == 30.0
+
+
+def test_four_minute_track_analyses_quickly():
+    x, truth = groove(124, 240, ROCK_44, 4, drift=0.02, drift_period=70.0, seed=11)
+    t0 = time.perf_counter()
+    g = bs.analyse_samples(x, SR)
+    took = time.perf_counter() - t0
+    assert took < 5.0, f"4-minute analysis took {took:.1f}s"
+    assert g.bpm == pytest.approx(124, rel=0.03)
+    rec, pre = match(g.beats, truth, 0.07)
+    assert rec >= 0.95 and pre >= 0.95
+    assert len(g.beats) == len(g.strengths) > 400
+
+
+def test_flux_method_gets_tempo_on_a_groove_but_phase_is_not_guaranteed():
+    """Known limitation: log-spectral flux weighs broadband hats as heavily as
+    the kick/snare, so on hat-heavy grooves it may lock to the off-beat. Tempo
+    and regularity must still be right (the method is unused by the pipeline)."""
+    x, truth = groove(120, 20, ROCK_44, 4, seed=4)
+    g = bs.analyse_samples(x, SR, method="flux")
+    assert g.bpm == pytest.approx(120, rel=0.03)
+    gaps = [b - a for a, b in zip(g.beats, g.beats[1:])]
+    assert max(gaps) - min(gaps) < 0.03
+
+
+def _has_mp3_encoder():
+    if shutil.which("ffmpeg") is None:
+        return False
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True)
+    return "libmp3lame" in r.stdout
+
+
+needs_mp3 = pytest.mark.skipif(not _has_mp3_encoder(), reason="ffmpeg libmp3lame missing")
+
+
+def _encode(tmp_path, samples, sr, name, *extra):
+    wav = tmp_path / "src.wav"
+    write_wav(wav, samples, sr)
+    out = tmp_path / name
+    r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(wav), "-c:a", "libmp3lame",
+                        "-b:a", "128k", *extra, str(out)], capture_output=True)
+    assert r.returncode == 0, r.stderr
+    return out
+
+
+@needs_mp3
+def test_real_mp3_round_trip_beats_stay_aligned_with_the_audio(tmp_path):
+    """MP3 adds encoder delay (1105 samples) and decoder delay (529). A file with
+    the LAME/Xing header is decoded gaplessly by ffmpeg, so beat times must stay
+    within a few ms of the source."""
+    x, truth = groove(120, 30, ROCK_44, 4, sr=22050, seed=3, jitter=0.003)
+    mp3 = _encode(tmp_path, x, 22050, "song.mp3")
+    g = bs.detect_beats(mp3)
+    assert g.bpm == pytest.approx(120, rel=0.01)
+    rec, pre = match(g.beats, truth, 0.03)
+    assert rec >= 0.95 and pre >= 0.95
+    off = statistics.median([((b - truth[0] + 0.25) % 0.5) - 0.25 for b in g.beats])
+    assert abs(off) < 0.012
+    # and the decoded length matches the source (no leading/trailing padding kept)
+    pcm = bs.decode_pcm(mp3)
+    assert abs(len(pcm) / bs.DEFAULT_SAMPLE_RATE - 30.0) < 0.03
+
+
+@needs_mp3
+def test_mp3_without_gapless_header_is_late_by_the_encoder_delay_only(tmp_path):
+    """Without a Xing/LAME header the ~1.6k-sample codec delay cannot be known:
+    beats come out late by that delay and no more (bounded, known limitation)."""
+    x, truth = groove(120, 30, ROCK_44, 4, sr=22050, seed=3, jitter=0.003)
+    mp3 = _encode(tmp_path, x, 22050, "raw.mp3", "-write_xing", "0")
+    g = bs.detect_beats(mp3)
+    assert g.bpm == pytest.approx(120, rel=0.01)
+    off = statistics.median([((b - truth[0] + 0.25) % 0.5) - 0.25 for b in g.beats])
+    assert 0.0 <= off < 0.06
+    rec, _ = match(g.beats, [t + off for t in truth], 0.03)
+    assert rec >= 0.95
+
+
+@needs_mp3
+def test_four_minute_mp3_end_to_end_under_budget(tmp_path):
+    x, truth = groove(132, 240, FUNK_44, 4, sr=SR, drift=0.015, drift_period=80.0, seed=21)
+    mp3 = _encode(tmp_path, x, SR, "long.mp3")
+    t0 = time.perf_counter()
+    g = bs.detect_beats(mp3)
+    took = time.perf_counter() - t0
+    assert took < 5.0, f"decode+analysis took {took:.1f}s"
+    assert g.bpm == pytest.approx(132, rel=0.03)
+    rec, pre = match(g.beats, truth, 0.08)
+    assert rec >= 0.93 and pre >= 0.93
+
+
+# ---- helper robustness -----------------------------------------------------
+
+def test_extrapolate_beats_zero_period_terminates():
+    g = BeatGrid(120, [1.0, 1.0, 1.0, 1.0], 1.0)
+    assert bs.extrapolate_beats(g, 100.0) == [1.0, 1.0, 1.0, 1.0]
+
+
+def test_extrapolate_beats_refuses_to_build_absurd_lists():
+    g = BeatGrid(120, [1.0, 1.0 + 1e-6, 1.0 + 2e-6], 1.0)
+    with pytest.raises(BeatError):
+        bs.extrapolate_beats(g, 1e6)
+
+
+@pytest.mark.parametrize("bad", [
+    {"bpm": float("nan"), "beats": [1.0], "confidence": 0.5},
+    {"bpm": 120.0, "beats": [1.0, float("inf")], "confidence": 0.5},
+    {"bpm": 120.0, "beats": [2.0, 1.0], "confidence": 0.5},
+    {"bpm": 120.0, "beats": [1.0], "confidence": float("nan")},
+    {"bpm": -5.0, "beats": [1.0], "confidence": 0.5},
+    {"bpm": 120.0, "beats": [1.0], "confidence": 0.5, "strengths": [float("nan")]},
+])
+def test_grid_from_dict_rejects_non_finite_or_unsorted(bad):
+    with pytest.raises(BeatError):
+        BeatGrid.from_dict(bad)
+
+
+def test_cache_with_poisoned_grid_is_ignored(tmp_path):
+    p = _music(tmp_path)
+    bs.save_cache(p, sample_grid())
+    cp = bs.cache_path_for(p)
+    d = json.loads(cp.read_text())
+    d["grid"]["beats"] = [2.0, 1.0]
+    cp.write_text(json.dumps(d))
+    assert bs.load_cache(p) is None
+
+
+def test_cache_not_poisoned_when_file_changes_during_detection(tmp_path):
+    """The fingerprint must describe the file that was analysed, not whatever is
+    on disk when detection finishes."""
+    p = _music(tmp_path)
+
+    def detect(path):
+        path.write_bytes(b"replaced while we were analysing")
+        return sample_grid()
+
+    bs.load_or_detect(p, detect)
+    assert bs.load_cache(p) is None
+
+
+def test_save_cache_failure_leaves_no_tmp_debris(tmp_path, monkeypatch):
+    p = _music(tmp_path)
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(bs.os, "replace", boom)
+    assert bs.save_cache(p, sample_grid()) is None
+    monkeypatch.undo()
+    assert sorted(os.listdir(tmp_path)) == ["m.mp3"]
+
+
+@pytest.mark.parametrize("total", [float("nan"), float("inf"), -1.0, 0.0])
+def test_plan_cuts_rejects_unusable_total(total):
+    with pytest.raises(BeatError):
+        bs.plan_cuts([1.0, 2.0, 3.0], total)
+
+
+@pytest.mark.parametrize("lo,hi", [(float("nan"), 4.0), (1.0, float("nan")), (1.0, float("inf"))])
+def test_plan_cuts_rejects_non_finite_limits(lo, hi):
+    with pytest.raises(BeatError):
+        bs.plan_cuts([1.0, 2.0, 3.0], 10.0, lo, hi)
+
+
+def test_fit_clips_rejects_non_finite_durations():
+    with pytest.raises(BeatError):
+        bs.fit_clips_to_beats([1.0, float("nan")], [0.5 * i for i in range(1, 20)])
+
+
+def test_cuts_for_highlights_rejects_non_finite_total():
+    with pytest.raises(BeatError):
+        bs.cuts_for_highlights([1.0, 2.0], [1.0, 2.0, 3.0], float("nan"))
