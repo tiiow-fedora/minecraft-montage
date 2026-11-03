@@ -13,12 +13,18 @@ from __future__ import annotations
 
 import json
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 FFMPEG = "ffmpeg"
 FFPROBE = "ffprobe"
+
+# Plain names, referenced relative to the ffmpeg cwd (see build_title_filter).
+TITLE_FILE = "_title.txt"
+SUBTITLE_FILE = "_subtitle.txt"
+FONT_COPY = "_font.ttf"
 
 DEFAULT_FONT = r"C:\Windows\Fonts\arialbd.ttf"
 
@@ -37,9 +43,9 @@ class Probe:
     has_audio: bool
 
 
-def _run(args, desc):
+def _run(args, desc, cwd=None):
     proc = subprocess.run(
-        args, capture_output=True, text=True, encoding="utf-8", errors="replace"
+        args, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace"
     )
     if proc.returncode != 0:
         tail = "\n".join((proc.stderr or "").strip().splitlines()[-15:])
@@ -130,11 +136,6 @@ def _esc_expr(s: str) -> str:
     return s.replace(",", r"\,")
 
 
-def _esc_path(p: str) -> str:
-    """Escape a Windows path for use inside an ffmpeg filter argument."""
-    return p.replace("\\", "/").replace(":", r"\:")
-
-
 def build_title_filter(title, work_dir, subtitle=None, font=DEFAULT_FONT,
                        height=1080, hold=2.5, fade=0.6):
     """drawtext filters overlaying a title (and optional subtitle) at the start.
@@ -146,7 +147,17 @@ def build_title_filter(title, work_dir, subtitle=None, font=DEFAULT_FONT,
     """
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
-    fp = _esc_path(str(font))
+    # The filtergraph is parsed at two nested levels, and a path containing an
+    # apostrophe, comma, colon or bracket (a profile or user folder like
+    # "John's Videos") cannot be escaped reliably through both. So no real path
+    # ever enters the graph: the font is copied next to the title text and
+    # ffmpeg is run with that folder as its cwd, referencing both by plain name.
+    # Callers must run ffmpeg with cwd=work_dir.
+    font_src = Path(font)
+    if not font_src.is_file():
+        raise EditError(f"font not found: {font_src}")
+    shutil.copyfile(font_src, work_dir / FONT_COPY)
+    fp = FONT_COPY
     size_main = max(28, int(height * 0.075))
     size_sub = max(18, int(height * 0.035))
     # alpha ramps in, holds, then ramps out
@@ -156,20 +167,20 @@ def build_title_filter(title, work_dir, subtitle=None, font=DEFAULT_FONT,
         f"if(lt(t,{hold + fade}),({hold + fade}-t)/{fade},0)))"
     )
 
-    title_file = work_dir / "_title.txt"
+    title_file = work_dir / TITLE_FILE
     title_file.write_text(title, encoding="utf-8")
     filters = [
-        f"drawtext=fontfile='{fp}':textfile='{_esc_path(str(title_file))}'"
+        f"drawtext=fontfile='{fp}':textfile='{TITLE_FILE}'"
         f":fontcolor=white:fontsize={size_main}"
         f":x=(w-text_w)/2:y=(h-text_h)/2-{int(height * 0.03)}"
         f":shadowcolor=black@0.6:shadowx=3:shadowy=3"
         f":alpha='{alpha}'"
     ]
     if subtitle:
-        sub_file = work_dir / "_subtitle.txt"
+        sub_file = work_dir / SUBTITLE_FILE
         sub_file.write_text(subtitle, encoding="utf-8")
         filters.append(
-            f"drawtext=fontfile='{fp}':textfile='{_esc_path(str(sub_file))}'"
+            f"drawtext=fontfile='{fp}':textfile='{SUBTITLE_FILE}'"
             f":fontcolor=white@0.85:fontsize={size_sub}"
             f":x=(w-text_w)/2:y=(h-text_h)/2+{int(height * 0.05)}"
             f":shadowcolor=black@0.6:shadowx=2:shadowy=2"
@@ -216,6 +227,8 @@ def build(
 
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    # A relative name starting with "-" would be parsed by ffmpeg as an option.
+    output = output.resolve()
 
     probes = [probe(c) for c in clips]
     width, height = probes[0].width, probes[0].height
@@ -223,7 +236,7 @@ def build(
 
     args = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-stats"]
     for c in clips:
-        args += ["-i", str(c)]
+        args += ["-i", str(c.resolve())]
     # music may be one path or several; several share the runtime equally
     tracks = []
     if music:
@@ -235,7 +248,7 @@ def build(
             # Every track is looped, then trimmed to its share. Looping means a
             # track shorter than its share still fills it instead of leaving
             # silence, and the trim is what actually sets the length.
-            args += ["-stream_loop", "-1", "-i", str(m)]
+            args += ["-stream_loop", "-1", "-i", str(m.resolve())]
 
     chains = []
 
@@ -266,9 +279,11 @@ def build(
 
     # Title overlay, then fade from/to black across the whole piece.
     vf = []
+    work_dir = None
     if title:
+        work_dir = output.parent / ".mcmontage_tmp"
         vf += build_title_filter(
-            title, work_dir=output.parent / ".mcmontage_tmp",
+            title, work_dir=work_dir,
             subtitle=subtitle, font=font, height=height,
         )
     if fade_in > 0:
@@ -341,7 +356,7 @@ def build(
     if dry_run:
         return args
 
-    _run(args, "ffmpeg assemble")
+    _run(args, "ffmpeg assemble", cwd=work_dir)
     if not output.is_file() or output.stat().st_size == 0:
         raise EditError(f"ffmpeg produced no output at {output}")
     return args
