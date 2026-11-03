@@ -82,6 +82,10 @@ file exists and has stopped growing; run `queue run` again after rendering.
   handler loads credentials from `secrets/` itself (git-ignored).
 - Uploads are private only, as in the rest of the app.
 
+Known residual risks: a reused pid keeps a stale lock until it ages out; a
+runner that loses its lock can still finish an in-flight handler's side effects;
+the whole queue file is rewritten on every change.
+
 Not verified: the Windows-specific parts (pid liveness via ctypes, lock and
 replace behaviour) have not been run on Windows.
 
@@ -93,8 +97,10 @@ tracking). On synthetic click and kick tracks it is within 0.1% of tempo at
 90/120/140 BPM. Caveats:
 
 - Tempo is assumed roughly constant.
-- Near the 60/180 BPM limits it may report an octave of the felt tempo; pass
-  `min_bpm`/`max_bpm` to force one.
+- Tempo below about 90 BPM is reported at double speed (65 comes out as 130), and
+  near the 60/180 limits it may be an octave off; pass `min_bpm`/`max_bpm` to
+  force one. Tempo is taken from the first 120 s of the track.
+- Phase can lock to the off-beat on syncopated, hat-heavy material.
 - Downbeats are a 4/4 accent heuristic.
 - It is untested on real dense mixes with my own ears; judge the first real
   result yourself. `--no-sync` turns it off.
