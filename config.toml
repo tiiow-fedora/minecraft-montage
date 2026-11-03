@@ -1,7 +1,7 @@
 # Defaults shown; delete a line to use the built-in default.
 
 [paths]
-# profile    = "C:/Users/user/AppData/Roaming/ModrinthApp/profiles/HarrisonsLongHaulWorld"
+# profile    = "~/AppData/Roaming/ModrinthApp/profiles/HarrisonsLongHaulWorld"
 # recordings = ""   # default: <profile>/replay_recordings
 # videos     = ""   # default: <profile>/replay_videos
 output = "out"

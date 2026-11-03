@@ -8,12 +8,8 @@ inside the mod under META-INF/jars/. This gathers all three sources.
 import pathlib
 import sys
 
-PROFILE = pathlib.Path(
-    r"C:/Users/user/AppData/Roaming/ModrinthApp/profiles/HarrisonsLongHaulWorld"
-)
-LIBRARIES = pathlib.Path(
-    r"C:/Users/user/AppData/Roaming/ModrinthApp/meta/libraries"
-)
+PROFILE = pathlib.Path.home() / "AppData/Roaming/ModrinthApp/profiles/HarrisonsLongHaulWorld"
+LIBRARIES = pathlib.Path.home() / "AppData/Roaming/ModrinthApp/meta/libraries"
 MOD_JAR = PROFILE / "mods" / "reforgedplaymod-1.21.1-0.3.jar"
 
 
