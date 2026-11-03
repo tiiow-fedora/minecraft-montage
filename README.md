@@ -348,3 +348,29 @@ mcmontage/music.py     licence records and automatic attribution
 mcmontage/youtube.py   OAuth + resumable upload (private)
 mcmontage/cli.py       command line
 ```
+
+## Thumbnails, generated metadata, private publishing
+
+Three CLI commands (and the modules behind them) cover the last mile:
+
+```
+python -m mcmontage thumbnail out/montage.mp4 --title "Nether hub" --subtitle "Day 3" --template bold
+python -m mcmontage meta --theme "Nether hub" --series "Survival Diaries" --day-index 3 --clips a.mp4 b.mp4 c.mp4
+python -m mcmontage publish out/montage.mp4 --thumbnail out/thumbnail.png --clips a.mp4 b.mp4 c.mp4   # dry run
+python -m mcmontage publish ... --yes                                                                # uploads, PRIVATE
+```
+
+- `mcmontage/thumbnail.py` samples frames with ffmpeg and scores them on
+  sharpness (Laplacian variance) and contrast, penalising near-black/blown-out
+  frames. Templates: `bold`, `minimal`, `banner`, `poster`. Output is 1280x720
+  and kept under YouTube's 2 MB limit. Needs Pillow only.
+- `mcmontage/metadata.py` builds title, tags, description and chapters.
+  Chapter times account for crossfades and follow YouTube's rules (start at
+  0:00, 3+ chapters, 10 s minimum); too-short clips fold into their neighbour.
+- `mcmontage/upload_meta.py` is the private-by-default layer. A plan is
+  private unless `allow_non_private=True` is set explicitly (nothing in the
+  package does), the final request body is re-checked before sending, and
+  credential-looking text or `secrets/` paths are refused. The network sits
+  behind an `Uploader` interface; tests use `FakeUploader`.
+
+Tests: `python -m pytest` (needs `pytest`, `Pillow`; ffmpeg tests skip without it).
