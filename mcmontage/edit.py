@@ -131,8 +131,14 @@ def _esc_expr(s: str) -> str:
 
 
 def _esc_path(p: str) -> str:
-    """Escape a Windows path for use inside an ffmpeg filter argument."""
-    return p.replace("\\", "/").replace(":", r"\:")
+    """Escape a path for use inside a single-quoted ffmpeg filter argument.
+
+    An apostrophe cannot be backslash-escaped inside single quotes, so close the
+    quote, emit an escaped quote, and reopen (the standard shell-style dance).
+    Without it a profile folder like C:\\Users\\O'Brien breaks the filtergraph.
+    """
+    return (p.replace("\\", "/").replace(":", r"\:")
+            .replace("'", "'\\\\\\''"))
 
 
 def build_title_filter(title, work_dir, subtitle=None, font=DEFAULT_FONT,

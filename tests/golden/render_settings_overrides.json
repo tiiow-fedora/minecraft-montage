@@ -1,0 +1,11 @@
+{
+  "renderMethod": "EQUIRECTANGULAR",
+  "encodingPreset": "MP4_POTATO",
+  "videoWidth": 1280,
+  "videoHeight": 720,
+  "framesPerSecond": 30,
+  "bitRate": 8000000,
+  "outputFile": "C:\\videos\\clip.mp4",
+  "renderNameTags": true,
+  "antiAliasing": "X4"
+}
