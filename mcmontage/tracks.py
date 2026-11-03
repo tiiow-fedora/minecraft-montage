@@ -13,6 +13,7 @@ no runtime entity id -- the id is only needed here, at plan time.
 from __future__ import annotations
 
 import bisect
+import functools
 import json
 import math
 import shutil
@@ -35,8 +36,10 @@ class Track:
     entity_id: int
     points: list  # [(t_ms, x, y, z, yaw, pitch), ...] sorted by t
 
-    @property
+    @functools.cached_property
     def times(self):
+        # Cached: at() is called once per sample point by smoothing, and
+        # rebuilding this list on every call made smoothing quadratic.
         return [p[0] for p in self.points]
 
     @property

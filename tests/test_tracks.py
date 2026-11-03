@@ -130,3 +130,14 @@ def test_dump_reports_missing_pieces(tmp_path, monkeypatch):
     monkeypatch.setattr(tracks, "CP_FILE", tmp_path / "nope.txt")
     with pytest.raises(tracks.TrackError, match="make_cp"):
         tracks.dump(p, tmp_path / "o.json")
+
+
+def test_times_list_is_cached_so_smoothing_is_not_quadratic():
+    t = Track(1, syn.walk_points(0, 60_000, 50, velocity=(1, 0, 0)))
+    assert t.times is t.times
+    # 36k points used to take ~15 s in choose_smoothing; generous bound.
+    import time
+    big = Track(1, syn.walk_points(0, 1_800_000, 50, velocity=(3, 0, 1), jitter=0.3))
+    t0 = time.time()
+    tracks.choose_smoothing(big, 0, 1_800_000, 90, 4.2)
+    assert time.time() - t0 < 5
