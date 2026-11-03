@@ -119,6 +119,8 @@ def read_render_queue(mcpr: Path) -> list[dict]:
         raise ReplayError(f"{RENDER_QUEUE_ENTRY} is not a list: {type(queue).__name__}")
     out = []
     for job in queue:
+        if not isinstance(job, dict):
+            raise ReplayError(f"{RENDER_QUEUE_ENTRY} has a non-object job entry")
         raw = job.get("timeline")
         decoded = json.loads(raw) if isinstance(raw, str) else raw
         out.append({**job, "timeline": decoded, "_timeline_raw": raw})
@@ -147,18 +149,20 @@ def write_render_queue(mcpr: Path, jobs: list[dict], *, backup: bool = True) -> 
     payload = json.dumps([_encode_job(j) for j in jobs], separators=(",", ":"))
     tmp = mcpr.with_suffix(mcpr.suffix + ".tmp")
 
-    with zipfile.ZipFile(mcpr) as src, zipfile.ZipFile(
-        tmp, "w", zipfile.ZIP_DEFLATED
-    ) as dst:
-        for item in src.infolist():
-            if item.filename == RENDER_QUEUE_ENTRY:
-                continue
-            # copy compressed payload through without re-deflating the big
-            # recording.tmcpr entry
-            dst.writestr(item, src.read(item.filename))
-        dst.writestr(RENDER_QUEUE_ENTRY, payload.encode("utf-8"))
-
-    tmp.replace(mcpr)
+    try:
+        with zipfile.ZipFile(mcpr) as src, zipfile.ZipFile(
+            tmp, "w", zipfile.ZIP_DEFLATED
+        ) as dst:
+            for item in src.infolist():
+                if item.filename == RENDER_QUEUE_ENTRY:
+                    continue
+                dst.writestr(item, src.read(item.filename))
+            dst.writestr(RENDER_QUEUE_ENTRY, payload.encode("utf-8"))
+        tmp.replace(mcpr)
+    except BaseException:
+        # Never leave a partial archive behind; the original is untouched.
+        tmp.unlink(missing_ok=True)
+        raise
     return mcpr
 
 
