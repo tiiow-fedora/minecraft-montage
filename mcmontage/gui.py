@@ -418,6 +418,8 @@ class App:
             nums = [float(p) for p in parts]
         except ValueError:
             raise ValueError("not a time: %r" % text) from None
+        if any(n != n or n in (float("inf"), float("-inf")) for n in nums):
+            raise ValueError("not a time: %r" % text)
         if any(n < 0 for n in nums):
             raise ValueError("negative time: %r" % text)
         seconds = 0.0
