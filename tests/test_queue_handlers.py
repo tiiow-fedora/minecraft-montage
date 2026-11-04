@@ -212,6 +212,7 @@ def test_render_wait_parks_when_file_empty(cfg, ft):
         h.render_wait(rw_ctx(out_file="/v/a.mp4"))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="fixture uses POSIX-style absolute paths")
 def test_render_wait_returns_after_stable_window(cfg, ft):
     h = handlers(cfg, ft, stat=lambda p: FakeStat(1234), stable_seconds=5, poll_seconds=1)
     out = h.render_wait(rw_ctx(out_file="/v/a.mp4"))
@@ -271,6 +272,7 @@ def test_render_wait_file_vanishes(cfg, ft):
         h.render_wait(rw_ctx(out_file="/v/a.mp4"))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="fixture uses POSIX-style absolute paths")
 def test_render_wait_uses_plan_out_file(cfg, ft):
     seen = []
     h = handlers(cfg, ft, stat=lambda p: (seen.append(str(p)) or FakeStat(5)))
@@ -578,6 +580,7 @@ def auto_env(monkeypatch):
     return calls
 
 
+@pytest.mark.skipif(os.name == "nt", reason="fixture uses POSIX-style absolute paths")
 def test_autoplan_happy_path(cfg, ft, auto_env):
     out = handlers(cfg, ft).autoplan(
         make_ctx("autoplan", {"replay": "r.mcpr", "total": 40, "seconds_each": 5}))
@@ -1002,6 +1005,7 @@ def test_cli_run_waiting_prints_hint(env, monkeypatch, capsys):
     assert "waiting 1" in out and "manual step" in out
 
 
+@pytest.mark.skipif(os.name == "nt", reason="os.kill(SIGINT) terminates the process on Windows")
 def test_cli_run_ctrl_c_stops_cleanly(env, monkeypatch, capsys):
     q = JobQueue(env.qpath)
     q.add("a")
