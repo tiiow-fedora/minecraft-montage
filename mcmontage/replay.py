@@ -90,18 +90,21 @@ def inspect(mcpr: Path) -> ReplayInfo:
     mcpr = Path(mcpr)
     if not mcpr.is_file():
         raise ReplayError(f"no such replay: {mcpr}")
-    with zipfile.ZipFile(mcpr) as zf:
-        names = zf.namelist()
-        meta = _read_json_entry(zf, METADATA_ENTRY) or {}
-        if not isinstance(meta, dict):
-            meta = {}
-        return ReplayInfo(
-            path=mcpr,
-            entries=names,
-            metadata=meta,
-            has_render_queue=RENDER_QUEUE_ENTRY in names,
-            has_timelines=TIMELINES_ENTRY in names,
-        )
+    try:
+        with zipfile.ZipFile(mcpr) as zf:
+            names = zf.namelist()
+            meta = _read_json_entry(zf, METADATA_ENTRY) or {}
+            if not isinstance(meta, dict):
+                meta = {}
+            return ReplayInfo(
+                path=mcpr,
+                entries=names,
+                metadata=meta,
+                has_render_queue=RENDER_QUEUE_ENTRY in names,
+                has_timelines=TIMELINES_ENTRY in names,
+            )
+    except (zipfile.BadZipFile, ValueError) as exc:
+        raise ReplayError(f"{mcpr.name}: not a readable replay ({exc})") from exc
 
 
 def read_render_queue(mcpr: Path) -> list[dict]:
@@ -111,14 +114,20 @@ def read_render_queue(mcpr: Path) -> list[dict]:
     "_timeline_raw": <original string>} so a round-trip can be compared
     byte-for-byte against what the mod wrote.
     """
-    with zipfile.ZipFile(mcpr) as zf:
-        queue = _read_json_entry(zf, RENDER_QUEUE_ENTRY)
+    try:
+        with zipfile.ZipFile(mcpr) as zf:
+            queue = _read_json_entry(zf, RENDER_QUEUE_ENTRY)
+    except (zipfile.BadZipFile, ValueError) as exc:
+        raise ReplayError(
+            f"{Path(mcpr).name}: cannot read {RENDER_QUEUE_ENTRY} ({exc})") from exc
     if queue is None:
         return []
     if not isinstance(queue, list):
         raise ReplayError(f"{RENDER_QUEUE_ENTRY} is not a list: {type(queue).__name__}")
     out = []
     for job in queue:
+        if not isinstance(job, dict):
+            raise ReplayError(f"{RENDER_QUEUE_ENTRY} has a non-object job entry")
         raw = job.get("timeline")
         decoded = json.loads(raw) if isinstance(raw, str) else raw
         out.append({**job, "timeline": decoded, "_timeline_raw": raw})
@@ -147,18 +156,20 @@ def write_render_queue(mcpr: Path, jobs: list[dict], *, backup: bool = True) -> 
     payload = json.dumps([_encode_job(j) for j in jobs], separators=(",", ":"))
     tmp = mcpr.with_suffix(mcpr.suffix + ".tmp")
 
-    with zipfile.ZipFile(mcpr) as src, zipfile.ZipFile(
-        tmp, "w", zipfile.ZIP_DEFLATED
-    ) as dst:
-        for item in src.infolist():
-            if item.filename == RENDER_QUEUE_ENTRY:
-                continue
-            # copy compressed payload through without re-deflating the big
-            # recording.tmcpr entry
-            dst.writestr(item, src.read(item.filename))
-        dst.writestr(RENDER_QUEUE_ENTRY, payload.encode("utf-8"))
-
-    tmp.replace(mcpr)
+    try:
+        with zipfile.ZipFile(mcpr) as src, zipfile.ZipFile(
+            tmp, "w", zipfile.ZIP_DEFLATED
+        ) as dst:
+            for item in src.infolist():
+                if item.filename == RENDER_QUEUE_ENTRY:
+                    continue
+                dst.writestr(item, src.read(item.filename))
+            dst.writestr(RENDER_QUEUE_ENTRY, payload.encode("utf-8"))
+        tmp.replace(mcpr)
+    except BaseException:
+        # Never leave a partial archive behind; the original is untouched.
+        tmp.unlink(missing_ok=True)
+        raise
     return mcpr
 
 

@@ -81,7 +81,16 @@ def plan_replay(
             f"reports duration={replay_len}ms"
         )
 
+    if start < 0:
+        raise PipelineError(f"replay span starts before the recording (start={start}ms)")
+    if replay_len and end > replay_len:
+        raise PipelineError(
+            f"replay span ends after the recording (end={end}ms, the replay "
+            f"is {replay_len}ms long)"
+        )
     duration_ms = int(seconds * 1000)
+    if duration_ms <= 0:
+        raise PipelineError(f"video length must be positive (got {seconds}s)")
     speedup = tl_mod.speedup_factor(start, end, duration_ms)
     tp = tl_mod.time_path(start, end, duration_ms)
 
@@ -228,6 +237,7 @@ def batch_prepare(
     replay should not cost you the other five. Returns (results, failures).
     """
     from . import sessions as sessions_mod
+    from . import tracks as tracks_mod
 
     if minecraft_running():
         raise PipelineError(
@@ -265,7 +275,8 @@ def batch_prepare(
                 log=lambda m: log("  " + m), **camera
             )
             results.append(summary)
-        except (PipelineError, replay_mod.ReplayError, OSError) as exc:
+        except (PipelineError, replay_mod.ReplayError, tracks_mod.TrackError,
+                OSError) as exc:
             log("  FAILED: %s" % exc)
             failures.append((path, str(exc)))
 

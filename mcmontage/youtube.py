@@ -36,13 +36,18 @@ secrets/token.json. Both files are secrets; keep them out of version control.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
-DEFAULT_CLIENT_SECRET = Path("secrets/client_secret.json")
-DEFAULT_TOKEN = Path("secrets/token.json")
+# Anchored to the repo root, not the working directory, so launching the app
+# from elsewhere neither loses the token nor writes a new one outside the
+# git-ignored secrets/ folder.
+_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CLIENT_SECRET = _ROOT / "secrets" / "client_secret.json"
+DEFAULT_TOKEN = _ROOT / "secrets" / "token.json"
 
 # YouTube rejects titles over 100 chars and descriptions over 5000.
 MAX_TITLE = 100
@@ -77,6 +82,12 @@ class VideoMeta:
                 f"description is {len(self.description)} chars, limit is "
                 f"{MAX_DESCRIPTION}"
             )
+        # The API rejects angle brackets in titles and descriptions.
+        for label, text in (("title", self.title), ("description", self.description)):
+            if "<" in text or ">" in text:
+                raise UploadError(
+                    f"{label} contains '<' or '>', which YouTube does not allow"
+                )
         if self.privacy not in VALID_PRIVACY:
             raise UploadError(f"bad privacy {self.privacy!r}")
         total_tags = sum(len(t) for t in self.tags)
@@ -132,9 +143,19 @@ def _credentials(client_secret, token_path):
 
     if creds and creds.valid:
         return creds
+    refreshed = False
     if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-    else:
+        from google.auth.exceptions import RefreshError
+
+        try:
+            creds.refresh(Request())
+            refreshed = True
+        except RefreshError:
+            # Revoked or expired refresh token (common for "Testing" projects,
+            # whose tokens last 7 days): fall through to a fresh consent flow
+            # rather than crashing.
+            creds = None
+    if not refreshed:
         if not client_secret.is_file():
             raise UploadError(
                 f"missing OAuth client secret at {client_secret}. See the setup "
@@ -144,13 +165,29 @@ def _credentials(client_secret, token_path):
         flow = InstalledAppFlow.from_client_secrets_file(str(client_secret), SCOPES)
         creds = flow.run_local_server(port=0)
 
-    token_path.parent.mkdir(parents=True, exist_ok=True)
-    token_path.write_text(creds.to_json(), encoding="utf-8")
-    try:
-        token_path.chmod(0o600)
-    except OSError:
-        pass
+    _write_private(token_path, creds.to_json())
     return creds
+
+
+def _write_private(path: Path, text: str) -> None:
+    """Write a secret file that is never world-readable, even momentarily.
+
+    The mode is applied at creation (not chmod'd afterwards) and the content is
+    swapped in atomically so a crash cannot leave a truncated token behind.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def upload(
@@ -160,6 +197,7 @@ def upload(
     token_path=DEFAULT_TOKEN,
     chunk_size=8 * 1024 * 1024,
     progress=None,
+    allow_non_private=False,
 ):
     """Upload a video resumably. Returns the created video resource.
 
@@ -176,6 +214,11 @@ def upload(
     if video_path.stat().st_size == 0:
         raise UploadError(f"video is empty: {video_path}")
     meta.validate()
+    if meta.privacy != "private" and not allow_non_private:
+        raise UploadError(
+            f"refusing to upload as {meta.privacy!r}; pass allow_non_private=True "
+            "to override (unverified API projects are locked to private anyway)"
+        )
 
     creds = _credentials(client_secret, token_path)
     youtube = build_service("youtube", "v3", credentials=creds, cache_discovery=False)

@@ -1,0 +1,13 @@
+{
+  "start": 0,
+  "end": 60000,
+  "seconds": 10,
+  "speedup": 6.0,
+  "mode": "follow",
+  "entity": 100,
+  "entity_how": "auto-detected",
+  "samples": 1201,
+  "travelled": 274.782,
+  "smooth_ms": 4000,
+  "jobs": 1
+}

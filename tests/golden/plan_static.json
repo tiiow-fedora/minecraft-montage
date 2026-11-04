@@ -1,0 +1,175 @@
+[
+  {
+    "timeline": {
+      "": [
+        {
+          "keyframes": [
+            {
+              "time": 0,
+              "properties": {
+                "timestamp": 0
+              }
+            },
+            {
+              "time": 30000,
+              "properties": {
+                "timestamp": 600000
+              }
+            }
+          ],
+          "segments": [
+            0
+          ],
+          "interpolators": [
+            {
+              "type": "linear",
+              "properties": [
+                "timestamp"
+              ]
+            }
+          ]
+        },
+        {
+          "keyframes": [
+            {
+              "time": 0,
+              "properties": {
+                "camera:position": [
+                  112.5,
+                  70.0,
+                  -20.25
+                ],
+                "camera:rotation": [
+                  90.0,
+                  26.565,
+                  0.0
+                ]
+              }
+            },
+            {
+              "time": 5000,
+              "properties": {
+                "camera:position": [
+                  110.8923,
+                  70.0,
+                  -14.25
+                ],
+                "camera:rotation": [
+                  120.0,
+                  26.565,
+                  0.0
+                ]
+              }
+            },
+            {
+              "time": 10000,
+              "properties": {
+                "camera:position": [
+                  106.5,
+                  70.0,
+                  -9.8577
+                ],
+                "camera:rotation": [
+                  150.0,
+                  26.565,
+                  0.0
+                ]
+              }
+            },
+            {
+              "time": 15000,
+              "properties": {
+                "camera:position": [
+                  100.5,
+                  70.0,
+                  -8.25
+                ],
+                "camera:rotation": [
+                  180.0,
+                  26.565,
+                  0.0
+                ]
+              }
+            },
+            {
+              "time": 20000,
+              "properties": {
+                "camera:position": [
+                  94.5,
+                  70.0,
+                  -9.8577
+                ],
+                "camera:rotation": [
+                  210.0,
+                  26.565,
+                  0.0
+                ]
+              }
+            },
+            {
+              "time": 25000,
+              "properties": {
+                "camera:position": [
+                  90.1077,
+                  70.0,
+                  -14.25
+                ],
+                "camera:rotation": [
+                  240.0,
+                  26.565,
+                  0.0
+                ]
+              }
+            },
+            {
+              "time": 30000,
+              "properties": {
+                "camera:position": [
+                  88.5,
+                  70.0,
+                  -20.25
+                ],
+                "camera:rotation": [
+                  270.0,
+                  26.565,
+                  0.0
+                ]
+              }
+            }
+          ],
+          "segments": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "interpolators": [
+            {
+              "type": {
+                "type": "catmull-rom-spline",
+                "alpha": 0.5
+              },
+              "properties": [
+                "camera:position",
+                "camera:rotation"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "settings": {
+      "renderMethod": "DEFAULT",
+      "encodingPreset": "MP4_CUSTOM",
+      "videoWidth": 1920,
+      "videoHeight": 1080,
+      "framesPerSecond": 60,
+      "bitRate": 20000000,
+      "outputFile": "/videos/day1_1.mp4",
+      "renderNameTags": false,
+      "antiAliasing": "NONE"
+    }
+  }
+]

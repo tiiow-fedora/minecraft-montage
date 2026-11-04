@@ -1,0 +1,9 @@
+Preparing 3 clip(s) from session(s) 1, 2 at 20s each.
+
+--- dry run, nothing written ---
+  rename r1.mcpr            -> day1_1.mcpr
+  rename r2.mcpr            -> day1_2.mcpr
+  rename r3.mcpr            -> day2_1.mcpr
+  prepare r1.mcpr            10.0 min -> 20s  (x30)
+  prepare r2.mcpr            10.0 min -> 20s  (x30)
+  prepare r3.mcpr            10.0 min -> 20s  (x30)
