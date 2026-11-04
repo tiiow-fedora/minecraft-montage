@@ -153,6 +153,10 @@ def apply_renames(plan):
     Renumbering a set of files inevitably means some new name is another file's
     current name, so a straight rename can clobber. Parking everything under
     temporary names first makes the order irrelevant.
+
+    Everything is validated before the first rename, and a failure part-way
+    puts parked files back, so an error never strands recordings under
+    __mcmontage_rename_N.tmp names.
     """
     if not plan:
         return []

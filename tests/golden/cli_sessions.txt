@@ -1,0 +1,9 @@
+A play-day runs 04:00 to 04:00, so playing past midnight still counts as the day you started.
+
+session 1  -  play-day 2026-09-01  -  2 clip(s), 60 min of footage
+    r1.mcpr            20:00   30.0 min  -> day1_1.mcpr
+    r2.mcpr            01:00   30.0 min  -> day1_2.mcpr
+
+session 2  -  play-day 2026-09-05  -  1 clip(s), 30 min of footage
+    r3.mcpr            21:00   30.0 min  -> day2_1.mcpr
+

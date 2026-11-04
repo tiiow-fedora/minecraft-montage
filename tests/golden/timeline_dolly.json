@@ -1,0 +1,128 @@
+{
+  "": [
+    {
+      "keyframes": [
+        {
+          "time": 0,
+          "properties": {
+            "timestamp": 10000
+          }
+        },
+        {
+          "time": 20000,
+          "properties": {
+            "timestamp": 70000
+          }
+        }
+      ],
+      "segments": [
+        0
+      ],
+      "interpolators": [
+        {
+          "type": "linear",
+          "properties": [
+            "timestamp"
+          ]
+        }
+      ]
+    },
+    {
+      "keyframes": [
+        {
+          "time": 0,
+          "properties": {
+            "camera:position": [
+              0.0,
+              70.0,
+              0.0
+            ],
+            "camera:rotation": [
+              -45.0,
+              11.977,
+              0.0
+            ]
+          }
+        },
+        {
+          "time": 5000,
+          "properties": {
+            "camera:position": [
+              10.0,
+              71.25,
+              10.0
+            ],
+            "camera:rotation": [
+              -45.0,
+              27.142,
+              0.0
+            ]
+          }
+        },
+        {
+          "time": 10000,
+          "properties": {
+            "camera:position": [
+              20.0,
+              72.5,
+              20.0
+            ],
+            "camera:rotation": [
+              -0.0,
+              90.0,
+              0.0
+            ]
+          }
+        },
+        {
+          "time": 15000,
+          "properties": {
+            "camera:position": [
+              30.0,
+              73.75,
+              30.0
+            ],
+            "camera:rotation": [
+              135.0,
+              34.584,
+              0.0
+            ]
+          }
+        },
+        {
+          "time": 20000,
+          "properties": {
+            "camera:position": [
+              40.0,
+              75.0,
+              40.0
+            ],
+            "camera:rotation": [
+              135.0,
+              21.251,
+              0.0
+            ]
+          }
+        }
+      ],
+      "segments": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "interpolators": [
+        {
+          "type": {
+            "type": "catmull-rom-spline",
+            "alpha": 0.5
+          },
+          "properties": [
+            "camera:position",
+            "camera:rotation"
+          ]
+        }
+      ]
+    }
+  ]
+}
