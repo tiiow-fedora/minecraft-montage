@@ -136,6 +136,17 @@ def _esc_expr(s: str) -> str:
     return s.replace(",", r"\,")
 
 
+def _esc_path(p: str) -> str:
+    """Escape a path for use inside a single-quoted ffmpeg filter argument.
+
+    An apostrophe cannot be backslash-escaped inside single quotes, so close the
+    quote, emit an escaped quote, and reopen (the standard shell-style dance).
+    Without it a profile folder like C:\\Users\\O'Brien breaks the filtergraph.
+    """
+    return (p.replace("\\", "/").replace(":", r"\:")
+            .replace("'", "'\\\\\\''"))
+
+
 def build_title_filter(title, work_dir, subtitle=None, font=DEFAULT_FONT,
                        height=1080, hold=2.5, fade=0.6):
     """drawtext filters overlaying a title (and optional subtitle) at the start.
@@ -270,10 +281,15 @@ def build(
         for i in range(1, len(clips)):
             offset = max(0.0, total - xfade)
             nxt = f"x{i}"
-            chains.append(
-                f"[{last}][v{i}]xfade=transition=fade:duration={xfade}"
-                f":offset={offset:.3f}[{nxt}]"
-            )
+            if xfade > 0:
+                chains.append(
+                    f"[{last}][v{i}]xfade=transition=fade:duration={xfade}"
+                    f":offset={offset:.3f}[{nxt}]"
+                )
+            else:
+                # xfade with duration=0 silently drops the second clip; a hard
+                # cut is what "no crossfade" means.
+                chains.append(f"[{last}][v{i}]concat=n=2:v=1:a=0[{nxt}]")
             last = nxt
             total = offset + probes[i].duration
 
@@ -299,6 +315,10 @@ def build(
     amap = None
     if tracks:
         n = len(tracks)
+        # Each track's share must be at least as long as the crossfade into it,
+        # or acrossfade never terminates (ffmpeg hangs). share >= xfade exactly
+        # when total >= xfade, so cap it at half the video.
+        music_xfade = min(music_xfade, total / 2)
         # Each track gets an equal share. Crossfades overlap neighbours, so
         # every share is padded by the overlap it gives away; without that the
         # bed would finish (n-1)*music_xfade short of the video.

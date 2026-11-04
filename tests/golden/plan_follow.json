@@ -1,0 +1,207 @@
+[
+  {
+    "timeline": {
+      "": [
+        {
+          "keyframes": [
+            {
+              "time": 0,
+              "properties": {
+                "timestamp": 0
+              }
+            },
+            {
+              "time": 10000,
+              "properties": {
+                "timestamp": 60000
+              }
+            }
+          ],
+          "segments": [
+            0
+          ],
+          "interpolators": [
+            {
+              "type": "linear",
+              "properties": [
+                "timestamp"
+              ]
+            }
+          ]
+        },
+        {
+          "keyframes": [
+            {
+              "time": 0,
+              "properties": {
+                "camera:position": [
+                  13.9759,
+                  71.6,
+                  1.0052
+                ],
+                "camera:rotation": [
+                  90.0,
+                  26.565,
+                  0.0
+                ]
+              }
+            },
+            {
+              "time": 1250,
+              "properties": {
+                "camera:position": [
+                  26.065,
+                  71.6,
+                  12.0811
+                ],
+                "camera:rotation": [
+                  112.5,
+                  26.565,
+                  0.0
+                ]
+              }
+            },
+            {
+              "time": 2500,
+              "properties": {
+                "camera:position": [
+                  38.522,
+                  71.6,
+                  23.4882
+                ],
+                "camera:rotation": [
+                  135.0,
+                  26.565,
+                  0.0
+                ]
+              }
+            },
+            {
+              "time": 3750,
+              "properties": {
+                "camera:position": [
+                  49.6364,
+                  71.6,
+                  33.6177
+                ],
+                "camera:rotation": [
+                  157.5,
+                  26.565,
+                  0.0
+                ]
+              }
+            },
+            {
+              "time": 5000,
+              "properties": {
+                "camera:position": [
+                  59.9705,
+                  71.6,
+                  41.9996
+                ],
+                "camera:rotation": [
+                  180.0,
+                  26.565,
+                  0.0
+                ]
+              }
+            },
+            {
+              "time": 6250,
+              "properties": {
+                "camera:position": [
+                  70.4017,
+                  71.6,
+                  48.603
+                ],
+                "camera:rotation": [
+                  202.5,
+                  26.565,
+                  0.0
+                ]
+              }
+            },
+            {
+              "time": 7500,
+              "properties": {
+                "camera:position": [
+                  81.524,
+                  71.6,
+                  53.472
+                ],
+                "camera:rotation": [
+                  225.0,
+                  26.565,
+                  0.0
+                ]
+              }
+            },
+            {
+              "time": 8750,
+              "properties": {
+                "camera:position": [
+                  93.9192,
+                  71.6,
+                  57.0598
+                ],
+                "camera:rotation": [
+                  247.5,
+                  26.565,
+                  0.0
+                ]
+              }
+            },
+            {
+              "time": 10000,
+              "properties": {
+                "camera:position": [
+                  105.9675,
+                  71.6,
+                  59.0045
+                ],
+                "camera:rotation": [
+                  270.0,
+                  26.565,
+                  0.0
+                ]
+              }
+            }
+          ],
+          "segments": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "interpolators": [
+            {
+              "type": {
+                "type": "catmull-rom-spline",
+                "alpha": 0.5
+              },
+              "properties": [
+                "camera:position",
+                "camera:rotation"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "settings": {
+      "renderMethod": "DEFAULT",
+      "encodingPreset": "MP4_CUSTOM",
+      "videoWidth": 1920,
+      "videoHeight": 1080,
+      "framesPerSecond": 60,
+      "bitRate": 20000000,
+      "outputFile": "/videos/day1_1.mp4",
+      "renderNameTags": false,
+      "antiAliasing": "NONE"
+    }
+  }
+]

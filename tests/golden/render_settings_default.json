@@ -1,0 +1,11 @@
+{
+  "renderMethod": "DEFAULT",
+  "encodingPreset": "MP4_CUSTOM",
+  "videoWidth": 1920,
+  "videoHeight": 1080,
+  "framesPerSecond": 60,
+  "bitRate": 20000000,
+  "outputFile": "/videos/clip.mp4",
+  "renderNameTags": false,
+  "antiAliasing": "NONE"
+}

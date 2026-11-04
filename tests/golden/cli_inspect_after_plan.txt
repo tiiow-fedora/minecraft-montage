@@ -1,0 +1,31 @@
+replay   : <TMP>/rec/a.mcpr
+size     : 0.0 MB
+duration : 600000 ms (10.0 min)
+server   : synthetic.example
+entries  : metaData.json, recording.tmcpr, renderQueue.json
+renderQueue.json: present
+timelines.json  : absent
+
+--- render queue: 1 job(s) ---
+
+[job 0] settings:
+{
+  "renderMethod": "DEFAULT",
+  "encodingPreset": "MP4_CUSTOM",
+  "videoWidth": 1920,
+  "videoHeight": 1080,
+  "framesPerSecond": 60,
+  "bitRate": 20000000,
+  "outputFile": "<TMP>/vids/a.mp4",
+  "renderNameTags": false,
+  "antiAliasing": "NONE"
+}
+[job 0] timeline: 2 path(s)
+  TIME     keyframes=2 segments=[0] interpolators=[{"type": "linear", "properties": ["timestamp"]}]
+       {"time": 0, "properties": {"timestamp": 0}}
+       {"time": 20000, "properties": {"timestamp": 600000}}
+  POSITION keyframes=5 segments=[0, 0, 0, 0] interpolators=[{"type": {"type": "catmull-rom-spline", "alpha": 0.5}, "properties": ["camera:position", "camera:rotation"]}]
+       {"time": 0, "properties": {"camera:position": [40.0, 82.0, -3.0], "camera:rotation": [90.0, 30.964, 0.0]}}
+       {"time": 5000, "properties": {"camera:position": [10.0, 82.0, 27.0], "camera:rotation": [180.0, 30.964, 0.0]}}
+       {"time": 10000, "properties": {"camera:position": [-20.0, 82.0, -3.0], "camera:rotation": [270.0, 30.964, 0.0]}}
+       ... 2 more
