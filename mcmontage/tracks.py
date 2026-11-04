@@ -57,8 +57,9 @@ class Track:
             return tuple(pts[0][1:4])
         if ts >= pts[-1][0]:
             return tuple(pts[-1][1:4])
-        times = self.times
-        i = bisect.bisect_right(times, ts)
+        # bisect on the points directly: building self.times per call made every
+        # lookup O(n), so resampling a long track was quadratic.
+        i = bisect.bisect_right(pts, ts, key=lambda p: p[0])
         a, b = pts[i - 1], pts[i]
         span = b[0] - a[0]
         f = 0.0 if span == 0 else (ts - a[0]) / span

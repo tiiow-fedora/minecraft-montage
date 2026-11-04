@@ -41,6 +41,10 @@ Uploads are private-only and privacy is not a control on the form: an
 unverified API project cannot publish publicly anyway, so offering the choice
 would be a lie. Publishing stays a deliberate act in YouTube Studio.
 
+**Automatic montages** (highlight detection, richer camera shots, transitions,
+beat-synced cuts, batch queue with resume) are described in
+[docs/OVERHAUL.md](docs/OVERHAUL.md).
+
 ## Why one click
 
 ReplayMod-style rendering **cannot** be made headless. Verified against
